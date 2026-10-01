@@ -182,6 +182,8 @@ test "get rejects bad usage" {
     try expectExit(2, try sb.run(&.{ jj_get, "a/b", "c/d" }));
     try expectExit(2, try sb.run(&.{ jj_get, "a/b", "--root" }));
     try expectExit(0, try sb.run(&.{ jj_get, "--help" }));
+    const version = try sb.ok(&.{ jj_get, "--version" });
+    try testing.expect(std.mem.startsWith(u8, version, "jj-get "));
 }
 
 test "get reads root from jj config, env and flags in increasing precedence" {

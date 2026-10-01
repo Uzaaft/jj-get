@@ -82,6 +82,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    const exe_options = b.addOptions();
+    exe_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    exe.root_module.addOptions("build_options", exe_options);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

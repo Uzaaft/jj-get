@@ -6,9 +6,16 @@
   jujutsu,
 }:
 
+let
+  # Keep build.zig.zon the single source of truth for the version.
+  zon = lib.splitString "\n" (builtins.readFile ./build.zig.zon);
+  versionLine = lib.findFirst (
+    line: builtins.match " *\\.version = \"(.*)\",.*" line != null
+  ) null zon;
+in
 stdenv.mkDerivation {
   pname = "jj-get";
-  version = "0.0.0";
+  version = builtins.head (builtins.match " *\\.version = \"(.*)\",.*" versionLine);
 
   src = lib.fileset.toSource {
     root = ./.;

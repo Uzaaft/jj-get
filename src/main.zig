@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const build_options = @import("build_options");
 const jj_get = @import("jj_get");
 const Args = jj_get.Args;
 const config = jj_get.config;
@@ -26,6 +27,7 @@ const get_usage =
     \\  -c, --scheme <scheme>  Default scheme for short references (default: ssh)
     \\  -s, --skip-host        Don't create a directory for the host
     \\  -h, --help             Show this help
+    \\  -v, --version          Show the version
     \\
 ;
 
@@ -39,6 +41,7 @@ const list_usage =
     \\  -o, --out <format>  Output format: tree, flat or dump (default: tree)
     \\  -r, --root <path>   Root directory to scan (default: ~/repositories)
     \\  -h, --help          Show this help
+    \\  -v, --version       Show the version
     \\
     \\The root can also be set with JJGET_ROOT or jjget.root in jj's config.
     \\
@@ -80,6 +83,8 @@ fn getMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
 
         if (args.flag('h', "help")) {
             return printUsage(io, usage);
+        } else if (args.flag('v', "version")) {
+            return printVersion(io, "jj-get");
         } else if (!args.isPositional()) {
             try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
             return 2;
@@ -204,6 +209,8 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
             fetch = true;
         } else if (args.flag('h', "help")) {
             return printUsage(io, usage);
+        } else if (args.flag('v', "version")) {
+            return printVersion(io, "jj-list");
         } else if (!args.isPositional()) {
             try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
             return 2;
@@ -273,6 +280,12 @@ fn parseListOption(
         return false;
     }
     return true;
+}
+
+fn printVersion(io: Io, name: []const u8) !u8 {
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &.{});
+    try stdout_writer.interface.print("{s} {s}\n", .{ name, build_options.version });
+    return 0;
 }
 
 fn printUsage(io: Io, usage: []const u8) !u8 {
