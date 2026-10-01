@@ -367,6 +367,21 @@ test "get reports failures from a dump but clones the rest" {
     try expectExit(1, result);
     try testing.expect(std.mem.indexOf(u8, result.stderr, "1 of 2") != null);
     try testing.expect(sb.exists(try sb.dest(root, a)));
+    // Directories created for the failed clone are cleaned up, but ones
+    // shared with the successful clone stay.
+    try testing.expect(!sb.exists(try sb.dest(root, missing)));
+    try testing.expect(sb.exists(std.fs.path.dirname(try sb.dest(root, missing)).?));
+}
+
+test "get cleans up after a failed clone" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    try sb.tmp.dir.createDirPath(testing.io, "repos");
+    const result = try sb.run(&.{ jj_get, "--root", root, "file:///nonexistent/deep/repo" });
+    try expectExit(1, result);
+    try testing.expect(!sb.exists(try sb.path("repos/nonexistent")));
+    try testing.expect(sb.exists(root));
 }
 
 test "get rejects --dump combined with a repository" {

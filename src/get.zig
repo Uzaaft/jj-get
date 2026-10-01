@@ -17,6 +17,8 @@ pub const Options = struct {
 pub const Target = struct {
     source: []const u8,
     dest: []const u8,
+    /// The root `dest` lives under.
+    root: []const u8,
 };
 
 /// Resolves `repo` into the URL to clone and its `<root>/<host>/<path>`
@@ -26,6 +28,7 @@ pub fn resolve(arena: Allocator, repo: []const u8, opts: Options) url.ParseError
     return .{
         .source = try std.fmt.allocPrint(arena, "{f}", .{u}),
         .dest = try std.fs.path.join(arena, &.{ opts.root, try u.toPath(arena, opts.skip_host) }),
+        .root = opts.root,
     };
 }
 
@@ -58,9 +61,27 @@ pub fn clone(io: Io, target: Target, opts: CloneOptions) CloneError!void {
     argv.appendSliceAssumeCapacity(&.{ target.source, target.dest });
 
     var child = try std.process.spawn(io, .{ .argv = argv.items });
-    switch (try child.wait(io)) {
-        .exited => |code| if (code != 0) return error.CloneFailed,
-        else => return error.CloneFailed,
+    const ok = switch (try child.wait(io)) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        removeEmptyParents(io, target);
+        return error.CloneFailed;
+    }
+}
+
+/// jj creates every missing directory leading up to the destination and
+/// leaves them behind when the clone fails. Remove the ones that are
+/// still empty, stopping at the root.
+fn removeEmptyParents(io: Io, target: Target) void {
+    var path: ?[]const u8 = target.dest;
+    while (path) |p| : (path = std.fs.path.dirname(p)) {
+        if (p.len <= target.root.len or !std.mem.startsWith(u8, p, target.root)) break;
+        Io.Dir.cwd().deleteDir(io, p) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => break,
+        };
     }
 }
 
