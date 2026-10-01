@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const jj_get = @import("jj_get");
 const Args = jj_get.Args;
+const config = jj_get.config;
 
 const usage =
     \\Usage: jj-get [options] <repository>
@@ -35,13 +36,12 @@ pub fn main(init: std.process.Init) !u8 {
     defer stderr.flush() catch {};
 
     var repo: ?[]const u8 = null;
-    var root: ?[]const u8 = null;
     var branch: ?[]const u8 = null;
-    var opts: jj_get.get.Options = .{ .root = undefined };
+    var flags: config.Config = .{};
 
     var args: Args = .init((try init.minimal.args.toSlice(arena))[1..]);
     while (args.next()) |arg| {
-        const parsed = parseOption(&args, &opts, &root, &branch) catch {
+        const parsed = parseOption(&args, &flags, &branch) catch {
             try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
             return 2;
         };
@@ -62,12 +62,12 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    opts.root = root orelse blk: {
-        const home = init.environ_map.get("HOME") orelse {
-            try stderr.writeAll("error: HOME is not set, pass --root\n");
-            return 1;
-        };
-        break :blk try std.fs.path.join(arena, &.{ home, "repositories" });
+    const settings = try loadSettings(init, flags, stderr) orelse return 1;
+    const opts: jj_get.get.Options = .{
+        .root = settings.root.?,
+        .host = settings.host.?,
+        .scheme = settings.scheme.?,
+        .skip_host = settings.skip_host.?,
     };
 
     const target = jj_get.get.resolve(arena, repo orelse {
@@ -92,24 +92,69 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// Merges `flags` with the environment and jj config and fills in
+/// defaults, so every field of the result is set. Returns null after
+/// reporting an error.
+fn loadSettings(init: std.process.Init, flags: config.Config, stderr: *Io.Writer) !?config.Config {
+    const arena = init.arena.allocator();
+    var bad_key: []const u8 = "";
+
+    const env = config.fromEnv(init.environ_map, &bad_key) catch |err| switch (err) {
+        error.InvalidValue => {
+            try stderr.print("error: invalid value for {s}\n", .{bad_key});
+            return null;
+        },
+        else => |e| return e,
+    };
+    var settings = flags.orElse(env);
+
+    // Spawning jj is only worth it when something is still unset.
+    if (settings.root == null or settings.host == null or settings.scheme == null or settings.skip_host == null) {
+        const jj = config.fromJj(arena, init.io, &bad_key) catch |err| switch (err) {
+            error.InvalidValue => {
+                try stderr.print("error: invalid value for {s} in jj config\n", .{bad_key});
+                return null;
+            },
+            error.JjConfigFailed => {
+                try stderr.writeAll("error: failed to read jj config\n");
+                return null;
+            },
+            error.FileNotFound => {
+                try stderr.writeAll("error: jj not found in PATH\n");
+                return null;
+            },
+            else => |e| return e,
+        };
+        settings = settings.orElse(jj);
+    }
+
+    const home = init.environ_map.get("HOME");
+    settings = settings.orElse(.{
+        .root = if (home) |h| try std.fs.path.join(arena, &.{ h, "repositories" }) else null,
+        .host = "github.com",
+        .scheme = "ssh",
+        .skip_host = false,
+    });
+    settings.root = try config.expandHome(arena, settings.root orelse {
+        try stderr.writeAll("error: HOME is not set, pass --root\n");
+        return null;
+    }, home);
+    return settings;
+}
+
 /// Handles the options that configure where and how to clone, returning
 /// whether the current argument was one of them.
-fn parseOption(
-    args: *Args,
-    opts: *jj_get.get.Options,
-    root: *?[]const u8,
-    branch: *?[]const u8,
-) Args.Error!bool {
+fn parseOption(args: *Args, flags: *config.Config, branch: *?[]const u8) Args.Error!bool {
     if (try args.option('r', "root")) |v| {
-        root.* = v;
+        flags.root = v;
     } else if (try args.option('t', "host")) |v| {
-        opts.host = v;
+        flags.host = v;
     } else if (try args.option('c', "scheme")) |v| {
-        opts.scheme = v;
+        flags.scheme = v;
     } else if (try args.option('b', "branch")) |v| {
         branch.* = v;
     } else if (args.flag('s', "skip-host")) {
-        opts.skip_host = true;
+        flags.skip_host = true;
     } else {
         return false;
     }

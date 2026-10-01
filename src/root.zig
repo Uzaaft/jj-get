@@ -2,6 +2,7 @@
 const std = @import("std");
 
 pub const Args = @import("Args.zig");
+pub const config = @import("config.zig");
 pub const get = @import("get.zig");
 pub const url = @import("url.zig");
 

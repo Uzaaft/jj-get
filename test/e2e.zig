@@ -166,3 +166,39 @@ test "get rejects bad usage" {
     try expectExit(2, try sb.run(&.{ jj_get, "a/b", "--root" }));
     try expectExit(0, try sb.run(&.{ jj_get, "--help" }));
 }
+
+test "get reads root from jj config, env and flags in increasing precedence" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const url = try sb.source("src/project");
+    try sb.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "jj.toml",
+        .data =
+        \\[user]
+        \\name = "Test"
+        \\email = "test@example.com"
+        \\[jjget]
+        \\root = "~/from-jj"
+        \\
+        ,
+    });
+
+    _ = try sb.ok(&.{ jj_get, url });
+    try testing.expect(sb.exists(try sb.dest(try sb.path("home/from-jj"), url)));
+
+    try sb.env.put("JJGET_ROOT", try sb.path("from-env"));
+    _ = try sb.ok(&.{ jj_get, url });
+    try testing.expect(sb.exists(try sb.dest(try sb.path("from-env"), url)));
+
+    _ = try sb.ok(&.{ jj_get, "--root", try sb.path("from-flag"), url });
+    try testing.expect(sb.exists(try sb.dest(try sb.path("from-flag"), url)));
+}
+
+test "get rejects invalid config values" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    try sb.env.put("JJGET_SKIP_HOST", "maybe");
+    const result = try sb.run(&.{ jj_get, "a/b" });
+    try expectExit(1, result);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "JJGET_SKIP_HOST") != null);
+}
