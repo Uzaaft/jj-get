@@ -162,8 +162,15 @@ fn bookmarkStatus(arena: Allocator, b: list.Bookmark) ![]const u8 {
 }
 
 /// Describes the working-copy commit, e.g. `[ 2 changed 1 conflicted ]`,
-/// or returns an empty string when it has no changes.
+/// or returns an empty string when it has no changes. When the working
+/// copy couldn't be inspected, says why instead, since the counts would
+/// be out of date.
 fn worktreeStatus(arena: Allocator, st: list.Status) ![]const u8 {
+    if (st.problem) |p| return switch (p) {
+        .stale => "[ stale ]",
+        .snapshot_failed => "[ snapshot failed ]",
+        .no_working_copy => "[ no working copy ]",
+    };
     if (st.changed == 0 and st.conflicted == 0) return "";
     var out: Io.Writer.Allocating = .init(arena);
     const w = &out.writer;

@@ -83,6 +83,19 @@ pub const Status = struct {
     conflicted: u64 = 0,
     /// Local bookmarks, sorted by name.
     bookmarks: []const Bookmark = &.{},
+    /// Why the working copy couldn't be inspected, if it couldn't.
+    problem: ?Problem = null,
+
+    pub const Problem = enum {
+        /// The working copy is stale; its state is from the last snapshot.
+        stale,
+        /// Snapshotting failed, e.g. on an unreadable directory; the state
+        /// is from the last snapshot.
+        snapshot_failed,
+        /// The workspace has no working-copy commit, typically because it
+        /// was forgotten.
+        no_working_copy,
+    };
 
     pub fn bookmark(self: Status, name: []const u8) ?Bookmark {
         for (self.bookmarks) |b| if (std.mem.eql(u8, b.name, name)) return b;
@@ -100,28 +113,61 @@ pub const Status = struct {
 // point of view. The `git` pseudo-remote of colocated repositories
 // mirrors local state and is ignored.
 const status_revset = "@ | bookmarks() | tracked_remote_bookmarks() | heads(::@ & bookmarks()) | heads(::@ & remote_bookmarks())";
-const status_template =
+const working_copy_template =
     \\if(current_working_copy,
     \\  "wc\t" ++ self.diff().files().len() ++ "\t" ++ self.conflicted_files().len() ++ "\n") ++
     \\if(self.contained_in("heads(::@ & bookmarks())"),
     \\  local_bookmarks.map(|b| "near\t" ++ b.name() ++ "\n").join("")) ++
     \\if(self.contained_in("heads(::@ & remote_bookmarks())"),
     \\  remote_bookmarks.filter(|b| b.remote() != "git").map(|b|
-    \\    "nearremote\t" ++ b.name() ++ "@" ++ b.remote() ++ "\n").join("")) ++
+    \\    "nearremote\t" ++ b.name() ++ "@" ++ b.remote() ++ "\n").join(""))
+;
+const bookmarks_template =
     \\local_bookmarks.map(|b| "local\t" ++ b.name() ++ "\t" ++ b.conflict() ++ "\n").join("") ++
     \\remote_bookmarks.filter(|b| b.tracked() && b.tracking_present() && b.remote() != "git").map(|b|
     \\  "remote\t" ++ b.name() ++ "\t" ++ b.remote() ++ "\t" ++
     \\  b.tracking_behind_count().lower() ++ "\t" ++ b.tracking_ahead_count().lower() ++ "\n").join("")
 ;
+const status_template = working_copy_template ++ " ++\n" ++ bookmarks_template;
+
+// For a workspace without a working-copy commit, where `@` can't be
+// resolved at all.
+const bookmarks_revset = "bookmarks() | tracked_remote_bookmarks()";
 
 /// Reads the status of the repository at `path` with a single jj
 /// invocation, which also snapshots the working copy.
+///
+/// Repositories in an unusual state get a degraded status rather than
+/// an error where possible: when the working copy can't be snapshotted
+/// (it's stale, or a directory in it is unreadable) the last snapshot is
+/// used, and a workspace that has been forgotten still reports its
+/// bookmarks.
 pub fn status(arena: Allocator, io: Io, path: []const u8) Outcome(Status) {
-    const out = switch (jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "log", "--no-graph", "-r", status_revset, "-T", status_template })) {
-        .ok => |out| out,
-        .err => |msg| return .{ .err = msg },
+    const base = [_][]const u8{ "jj", "-R", path, "--color=never", "--no-pager" };
+    const log = [_][]const u8{ "log", "--no-graph", "-r" };
+
+    const first = switch (jj(arena, io, &(base ++ log ++ .{ status_revset, "-T", status_template }))) {
+        .ok => |out| return parsed(arena, out, null),
+        .err => |msg| msg,
     };
-    return if (parseStatus(arena, out)) |st| .{ .ok = st } else |err| .{ .err = @errorName(err) };
+    const offline = base ++ .{"--ignore-working-copy"} ++ log;
+    const second = switch (jj(arena, io, &(offline ++ .{ status_revset, "-T", status_template }))) {
+        .ok => |out| return parsed(arena, out, if (std.mem.indexOf(u8, first, "stale") != null) .stale else .snapshot_failed),
+        .err => |msg| msg,
+    };
+    if (std.mem.indexOf(u8, second, "doesn't have a working-copy commit") != null) {
+        switch (jj(arena, io, &(offline ++ .{ bookmarks_revset, "-T", bookmarks_template }))) {
+            .ok => |out| return parsed(arena, out, .no_working_copy),
+            .err => {},
+        }
+    }
+    return .{ .err = second };
+}
+
+fn parsed(arena: Allocator, out: []const u8, problem: ?Status.Problem) Outcome(Status) {
+    var st = parseStatus(arena, out) catch |err| return .{ .err = @errorName(err) };
+    st.problem = problem;
+    return .{ .ok = st };
 }
 
 /// Fetches from every remote, then reads the status of the repository.
@@ -149,8 +195,33 @@ fn jj(arena: Allocator, io: Io, argv: []const []const u8) Outcome([]const u8) {
         else => @errorName(err),
     } };
     if (result.term == .exited and result.term.exited == 0) return .{ .ok = result.stdout };
-    const msg = std.mem.trim(u8, result.stderr, " \n");
-    return .{ .err = if (std.mem.startsWith(u8, msg, "Error: ")) msg["Error: ".len..] else if (msg.len > 0) msg else "jj failed" };
+    return .{ .err = condense(arena, result.stderr) catch "jj failed" };
+}
+
+/// Turns jj's multi-line error report into one line: the error itself
+/// and, if any, its innermost cause. Hints are dropped.
+fn condense(arena: Allocator, stderr: []const u8) Allocator.Error![]const u8 {
+    var headline: ?[]const u8 = null;
+    var cause: ?[]const u8 = null;
+    var lines = std.mem.tokenizeScalar(u8, stderr, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "Hint:") or std.mem.startsWith(u8, line, "Caused by")) continue;
+        // Causes are numbered "1: ...", "2: ...", innermost last.
+        if (std.mem.indexOf(u8, line, ": ")) |i| {
+            if (std.fmt.parseInt(u8, line[0..i], 10)) |_| {
+                cause = line[i + 2 ..];
+                continue;
+            } else |_| {}
+        }
+        if (headline == null) headline = line;
+    }
+    var head = headline orelse return "jj failed";
+    for ([_][]const u8{ "Error: ", "Internal error: " }) |prefix| {
+        if (std.mem.startsWith(u8, head, prefix)) head = head[prefix.len..];
+    }
+    const c = cause orelse return head;
+    return std.fmt.allocPrint(arena, "{s}: {s}", .{ head, c });
 }
 
 fn parseStatus(arena: Allocator, out: []const u8) error{ InvalidOutput, OutOfMemory }!Status {
@@ -324,6 +395,27 @@ test parseStatus {
 
     try std.testing.expectError(error.InvalidOutput, parseStatus(arena.allocator(), "wc\tx\t0\n"));
     try std.testing.expectError(error.InvalidOutput, parseStatus(arena.allocator(), "bogus\n"));
+}
+
+test condense {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("The working copy is stale (not updated since operation 0b4c8868c690).", try condense(a,
+        \\Error: The working copy is stale (not updated since operation 0b4c8868c690).
+        \\Hint: Run `jj workspace update-stale` to update it.
+        \\See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
+        \\
+    ));
+    try std.testing.expectEqualStrings("Failed to check out a commit: An object with id 0889 could not be found", try condense(a,
+        \\Internal error: Failed to check out a commit
+        \\Caused by:
+        \\1: Failed to edit commit
+        \\2: Current working-copy commit not found
+        \\3: An object with id 0889 could not be found
+        \\
+    ));
+    try std.testing.expectEqualStrings("jj failed", try condense(a, ""));
 }
 
 test parseRemotes {

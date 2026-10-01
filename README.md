@@ -105,9 +105,13 @@ bookmark follows on its own line.
 | `no upstream` | Not tracking any remote |
 | `conflicted` | The bookmark is conflicted |
 | `[ 2 changed 1 conflicted ]` | Files changed and conflicted in the working-copy commit |
+| `[ stale ]` | The working copy is stale; run `jj workspace update-stale` |
+| `[ snapshot failed ]` | The working copy couldn't be snapshotted, e.g. an unreadable directory |
+| `[ no working copy ]` | The workspace has no working-copy commit, e.g. it was forgotten |
 
-Repositories that can't be read show `error`, with jj's messages listed
-after the tree, and make `jj-list` exit with status 1. Repositories are
+For the last three, bookmarks are still read, from the last snapshot.
+Repositories that can't be read at all show `error`, with jj's message
+condensed to one line after the tree, and make `jj-list` exit with status 1. Repositories are
 queried concurrently with one jj invocation each, and directories
 holding plain Git repositories aren't searched.
 

@@ -437,3 +437,57 @@ test "list colors output on request" {
     const plain = try sb.ok(&.{ try sb.jjList(), "--root", root });
     try testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
 }
+
+test "list degrades gracefully on stale, forgotten and unreadable working copies" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    const url = try sb.source("src/project");
+    try sb.clone(root, url);
+    const dest = try sb.dest(root, url);
+    const arena = sb.arena.allocator();
+
+    // Rewriting another workspace's working-copy commit while it has
+    // unsnapshotted changes makes it stale, as in jj's own tests.
+    const stale = try std.fs.path.join(arena, &.{ root, "stale" });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "new" });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "workspace", "add", "--name", "stale", stale });
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(arena, &.{ dest, "main-file" }), .data = "main" });
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(arena, &.{ stale, "file" }), .data = "stale" });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "squash" });
+
+    // A forgotten workspace has no working-copy commit at all.
+    const forgotten = try std.fs.path.join(arena, &.{ root, "forgotten" });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "workspace", "add", "--name", "forgotten", forgotten });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "workspace", "forget", "forgotten" });
+
+    // An unreadable directory makes snapshotting fail.
+    const locked = try std.fs.path.join(arena, &.{ dest, "locked" });
+    try Io.Dir.cwd().createDirPath(testing.io, locked);
+    _ = try sb.ok(&.{ "chmod", "000", locked });
+    defer _ = sb.ok(&.{ "chmod", "755", locked }) catch {};
+
+    const result = try sb.run(&.{ try sb.jjList(), "--root", root, "-o", "flat" });
+    try expectExit(0, result);
+    try testing.expectEqualStrings("main [ snapshot failed ]", try statusOf(result.stdout, dest));
+    try testing.expectEqualStrings("main [ stale ]", try statusOf(result.stdout, stale));
+    try testing.expect(std.mem.startsWith(u8, try statusOf(result.stdout, forgotten), "(no bookmark) [ no working copy ]"));
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "Oops") == null);
+}
+
+test "list condenses jj errors to one line" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    try sb.tmp.dir.createDirPath(testing.io, "repos/broken/.jj");
+
+    const result = try sb.run(&.{ try sb.jjList(), "--root", root, "-o", "flat" });
+    try expectExit(1, result);
+    var lines = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    var last: []const u8 = "";
+    var count: usize = 0;
+    while (lines.next()) |line| : (count += 1) last = line;
+    // The repository line, the header and exactly one line of explanation.
+    try testing.expectEqual(3, count);
+    try testing.expect(std.mem.startsWith(u8, last, try sb.path("repos/broken")));
+}
