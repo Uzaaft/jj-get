@@ -64,6 +64,56 @@ pub fn clone(io: Io, target: Target, opts: CloneOptions) CloneError!void {
     }
 }
 
+/// A line of a dump file.
+pub const DumpEntry = struct {
+    repo: []const u8,
+    branch: ?[]const u8 = null,
+};
+
+/// Parses a dump file as written by `jj-list --out dump`: one repository
+/// per line, optionally followed by a branch as in git-get dump files.
+/// Blank lines and `#` comments are ignored. On `error.InvalidLine`,
+/// `bad_line` is set to the 1-based line number.
+pub fn parseDump(arena: Allocator, contents: []const u8, bad_line: *usize) error{ InvalidLine, OutOfMemory }![]DumpEntry {
+    var entries: std.ArrayList(DumpEntry) = .empty;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    var n: usize = 0;
+    while (lines.next()) |raw| {
+        n += 1;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const entry: DumpEntry = .{ .repo = fields.next().?, .branch = fields.next() };
+        if (fields.next() != null) {
+            bad_line.* = n;
+            return error.InvalidLine;
+        }
+        try entries.append(arena, entry);
+    }
+    return entries.items;
+}
+
+test parseDump {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var bad: usize = 0;
+    const entries = try parseDump(arena.allocator(),
+        \\# my repos
+        \\https://github.com/grdl/git-get
+        \\
+        \\  grdl/other   dev  
+        \\
+    , &bad);
+    try std.testing.expectEqual(2, entries.len);
+    try std.testing.expectEqualStrings("https://github.com/grdl/git-get", entries[0].repo);
+    try std.testing.expectEqual(null, entries[0].branch);
+    try std.testing.expectEqualStrings("grdl/other", entries[1].repo);
+    try std.testing.expectEqualStrings("dev", entries[1].branch.?);
+
+    try std.testing.expectError(error.InvalidLine, parseDump(arena.allocator(), "a\nb c d\n", &bad));
+    try std.testing.expectEqual(2, bad);
+}
+
 test resolve {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

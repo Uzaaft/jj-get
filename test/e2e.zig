@@ -327,3 +327,48 @@ test "list dumps clone urls" {
     try testing.expectEqualStrings(want, result.stdout);
     try testing.expect(std.mem.indexOf(u8, result.stderr, "has no remote") != null);
 }
+
+test "get restores repositories from a dump" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const old = try sb.path("old");
+    const new = try sb.path("new");
+    const a = try sb.source("src/a");
+    const b = try sb.source("src/b");
+    try sb.clone(old, a);
+    try sb.clone(old, b);
+
+    const dump = try sb.ok(&.{ try sb.jjList(), "--root", old, "--out", "dump" });
+    try sb.tmp.dir.writeFile(testing.io, .{ .sub_path = "dump.txt", .data = dump });
+    const dump_path = try sb.path("dump.txt");
+
+    _ = try sb.ok(&.{ jj_get, "--root", new, "--dump", dump_path });
+    try testing.expect(sb.exists(try sb.dest(new, a)));
+    try testing.expect(sb.exists(try sb.dest(new, b)));
+
+    // Running it again skips what's already there.
+    const again = try sb.run(&.{ jj_get, "--root", new, "--dump", dump_path });
+    try expectExit(0, again);
+    try testing.expect(std.mem.indexOf(u8, again.stderr, "skipping") != null);
+}
+
+test "get reports failures from a dump but clones the rest" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    const a = try sb.source("src/a");
+    const missing = try std.fmt.allocPrint(sb.arena.allocator(), "file://{s}", .{try sb.path("src/missing")});
+    const data = try std.fmt.allocPrint(sb.arena.allocator(), "{s}\n{s}\n", .{ missing, a });
+    try sb.tmp.dir.writeFile(testing.io, .{ .sub_path = "dump.txt", .data = data });
+
+    const result = try sb.run(&.{ jj_get, "--root", root, "--dump", try sb.path("dump.txt") });
+    try expectExit(1, result);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "1 of 2") != null);
+    try testing.expect(sb.exists(try sb.dest(root, a)));
+}
+
+test "get rejects --dump combined with a repository" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    try expectExit(2, try sb.run(&.{ jj_get, "--dump", "x", "a/b" }));
+}

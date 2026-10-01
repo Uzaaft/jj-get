@@ -7,6 +7,7 @@ const config = jj_get.config;
 
 const get_usage =
     \\Usage: jj-get [options] <repository>
+    \\       jj-get [options] --dump <file>
     \\
     \\Clone a repository into <root>/<host>/<path> using jj.
     \\
@@ -18,6 +19,8 @@ const get_usage =
     \\
     \\Options:
     \\  -b, --branch <name>    Bookmark to check out instead of the default branch
+    \\  -d, --dump <file>      Clone every repository listed in a file, or - for
+    \\                         stdin, as written by jj-list --out dump
     \\  -t, --host <host>      Default host for short references (default: github.com)
     \\  -r, --root <path>      Root directory for repositories (default: ~/repositories)
     \\  -c, --scheme <scheme>  Default scheme for short references (default: ssh)
@@ -60,15 +63,15 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn getMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     const usage = get_usage;
-    const arena = init.arena.allocator();
     const io = init.io;
 
     var repo: ?[]const u8 = null;
     var branch: ?[]const u8 = null;
+    var dump: ?[]const u8 = null;
     var flags: config.Config = .{};
 
     while (args.next()) |arg| {
-        const parsed = parseOption(args, &flags, &branch) catch {
+        const parsed = parseOption(args, &flags, &branch, &dump) catch {
             try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
             return 2;
         };
@@ -87,6 +90,15 @@ fn getMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
         }
     }
 
+    if (dump != null and (repo != null or branch != null)) {
+        try stderr.print("error: --dump can't be combined with a repository or --branch\n\n{s}", .{usage});
+        return 2;
+    }
+    if (dump == null and repo == null) {
+        try stderr.print("error: missing repository\n\n{s}", .{usage});
+        return 2;
+    }
+
     const settings = try loadSettings(init, flags, stderr) orelse return 1;
     const opts: jj_get.get.Options = .{
         .root = settings.root.?,
@@ -95,25 +107,73 @@ fn getMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
         .skip_host = settings.skip_host.?,
     };
 
-    const target = jj_get.get.resolve(arena, repo orelse {
-        try stderr.print("error: missing repository\n\n{s}", .{usage});
-        return 2;
-    }, opts) catch |err| switch (err) {
+    if (dump) |path| return cloneDump(init, opts, path, stderr);
+    return switch (try cloneOne(init, opts, repo.?, branch, stderr)) {
+        .cloned => 0,
+        .exists => {
+            try stderr.print("error: {s} already exists\n", .{repo.?});
+            return 1;
+        },
+        .failed => 1,
+    };
+}
+
+const CloneOutcome = enum { cloned, exists, failed };
+
+fn cloneOne(init: std.process.Init, opts: jj_get.get.Options, repo: []const u8, branch: ?[]const u8, stderr: *Io.Writer) !CloneOutcome {
+    const target = jj_get.get.resolve(init.arena.allocator(), repo, opts) catch |err| switch (err) {
         error.EmptyPath => {
-            try stderr.print("error: invalid repository '{s}'\n", .{repo.?});
+            try stderr.print("error: invalid repository '{s}'\n", .{repo});
+            return .failed;
+        },
+        else => |e| return e,
+    };
+    // Flush before jj writes to the same stderr.
+    try stderr.flush();
+    jj_get.get.clone(init.io, target, .{ .branch = branch }) catch |err| switch (err) {
+        error.CloneFailed => return .failed,
+        error.AlreadyExists => return .exists,
+        else => |e| return e,
+    };
+    return .cloned;
+}
+
+/// Clones every repository in a dump file one after another, so jj's
+/// progress output stays readable. Existing repositories are skipped and
+/// failures don't stop the rest.
+fn cloneDump(init: std.process.Init, opts: jj_get.get.Options, path: []const u8, stderr: *Io.Writer) !u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const contents = if (std.mem.eql(u8, path, "-")) blk: {
+        var buffer: [4096]u8 = undefined;
+        var reader = Io.File.stdin().readerStreaming(io, &buffer);
+        break :blk try reader.interface.allocRemaining(arena, .unlimited);
+    } else Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch |err| {
+        try stderr.print("error: can't read {s}: {t}\n", .{ path, err });
+        return 1;
+    };
+
+    var bad_line: usize = 0;
+    const entries = jj_get.get.parseDump(arena, contents, &bad_line) catch |err| switch (err) {
+        error.InvalidLine => {
+            try stderr.print("error: {s}:{d}: expected a repository and an optional branch\n", .{ path, bad_line });
             return 1;
         },
         else => |e| return e,
     };
 
-    jj_get.get.clone(io, target, .{ .branch = branch }) catch |err| switch (err) {
-        error.CloneFailed => return 1,
-        error.AlreadyExists => {
-            try stderr.print("error: {s} already exists\n", .{target.dest});
-            return 1;
-        },
-        else => |e| return e,
-    };
+    var failed: usize = 0;
+    for (entries) |entry| {
+        switch (try cloneOne(init, opts, entry.repo, entry.branch, stderr)) {
+            .cloned => {},
+            .exists => try stderr.print("skipping {s}: already exists\n", .{entry.repo}),
+            .failed => failed += 1,
+        }
+    }
+    if (failed > 0) {
+        try stderr.print("error: {d} of {d} repositories failed to clone\n", .{ failed, entries.len });
+        return 1;
+    }
     return 0;
 }
 
@@ -266,7 +326,7 @@ fn loadSettings(init: std.process.Init, flags: config.Config, stderr: *Io.Writer
 
 /// Handles the options that configure where and how to clone, returning
 /// whether the current argument was one of them.
-fn parseOption(args: *Args, flags: *config.Config, branch: *?[]const u8) Args.Error!bool {
+fn parseOption(args: *Args, flags: *config.Config, branch: *?[]const u8, dump: *?[]const u8) Args.Error!bool {
     if (try args.option('r', "root")) |v| {
         flags.root = v;
     } else if (try args.option('t', "host")) |v| {
@@ -275,6 +335,8 @@ fn parseOption(args: *Args, flags: *config.Config, branch: *?[]const u8) Args.Er
         flags.scheme = v;
     } else if (try args.option('b', "branch")) |v| {
         branch.* = v;
+    } else if (try args.option('d', "dump")) |v| {
+        dump.* = v;
     } else if (args.flag('s', "skip-host")) {
         flags.skip_host = true;
     } else {
