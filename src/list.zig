@@ -150,6 +150,8 @@ pub fn status(arena: Allocator, io: Io, path: []const u8) Outcome(Status) {
         .ok => |out| return parsed(arena, out, null),
         .err => |msg| msg,
     };
+    // Retrying a wedged repository would only double the wait.
+    if (first.ptr == timed_out.ptr) return .{ .err = first };
     const offline = base ++ .{"--ignore-working-copy"} ++ log;
     const second = switch (jj(arena, io, &(offline ++ .{ status_revset, "-T", status_template }))) {
         .ok => |out| return parsed(arena, out, if (std.mem.indexOf(u8, first, "stale") != null) .stale else .snapshot_failed),
@@ -172,7 +174,7 @@ fn parsed(arena: Allocator, out: []const u8, problem: ?Status.Problem) Outcome(S
 
 /// Fetches from every remote, then reads the status of the repository.
 pub fn fetchAndStatus(arena: Allocator, io: Io, path: []const u8) Outcome(Status) {
-    switch (jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "git", "fetch", "--all-remotes" })) {
+    switch (jjTimeout(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "git", "fetch", "--all-remotes" }, fetch_timeout_seconds)) {
         .ok => {},
         .err => |msg| return .{ .err = msg },
     }
@@ -188,10 +190,25 @@ pub fn remoteUrl(arena: Allocator, io: Io, path: []const u8) Outcome(?[]const u8
     };
 }
 
+/// How long a single jj invocation may take before it's killed, so one
+/// wedged repository can't stall the whole listing. Fetches talk to the
+/// network and get longer.
+const timeout_seconds = 60;
+const fetch_timeout_seconds = 300;
+const timed_out = std.fmt.comptimePrint("jj didn't finish within {d}s", .{timeout_seconds});
+
 /// Runs jj, returning its stdout or, on failure, its error message.
 fn jj(arena: Allocator, io: Io, argv: []const []const u8) Outcome([]const u8) {
-    const result = std.process.run(arena, io, .{ .argv = argv }) catch |err| return .{ .err = switch (err) {
+    return jjTimeout(arena, io, argv, timeout_seconds);
+}
+
+fn jjTimeout(arena: Allocator, io: Io, argv: []const []const u8, seconds: i64) Outcome([]const u8) {
+    const result = std.process.run(arena, io, .{
+        .argv = argv,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(seconds), .clock = .awake } },
+    }) catch |err| return .{ .err = switch (err) {
         error.FileNotFound => "jj not found in PATH",
+        error.Timeout => if (seconds == timeout_seconds) timed_out else std.fmt.allocPrint(arena, "jj didn't finish within {d}s", .{seconds}) catch "jj timed out",
         else => @errorName(err),
     } };
     if (result.term == .exited and result.term.exited == 0) return .{ .ok = result.stdout };
