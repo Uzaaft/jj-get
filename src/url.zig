@@ -45,7 +45,10 @@ pub const ParseError = error{EmptyPath} || Allocator.Error;
 /// where the reference doesn't specify them. Returned slices either point
 /// into `raw` or are allocated with `gpa`; an arena is the expected use.
 pub fn parse(gpa: Allocator, raw: []const u8, default_host: []const u8, default_scheme: []const u8) ParseError!Url {
-    var url = if (parseScp(raw)) |scp|
+    var url = if (std.fs.path.isAbsolutePosix(raw))
+        // A local repository, as `git clone /path/to/repo` accepts.
+        Url{ .scheme = "file", .host = "", .path = raw }
+    else if (parseScp(raw)) |scp|
         Url{
             .scheme = "ssh",
             .user = scp.user,
@@ -152,6 +155,8 @@ test "toPath" {
         .{ "file://local/grdl/git-get", "local/grdl/git-get", "local/grdl/git-get" },
         .{ "gitlab.com/grdl/git-get", "gitlab.com/grdl/git-get", "grdl/git-get" },
         .{ "grdl/git-get", "github.com/grdl/git-get", "grdl/git-get" },
+        .{ "/srv/git/project.git", "srv/git/project", "srv/git/project" },
+        .{ "file:///srv/git/project", "srv/git/project", "srv/git/project" },
     };
     for (cases) |c| {
         try testToPath(c[0], false, c[1]);
@@ -171,6 +176,7 @@ test "default scheme" {
         .{ "git@github.com:grdl/git-get", "ssh", "ssh://git@github.com/grdl/git-get" },
         .{ "git@github.com:grdl/git-get", "https", "ssh://git@github.com/grdl/git-get" },
         .{ "gitlab.com/grdl/git-get", "https", "https://gitlab.com/grdl/git-get" },
+        .{ "/srv/git/project", "ssh", "file:///srv/git/project" },
     };
     for (cases) |c| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
