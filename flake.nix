@@ -15,10 +15,19 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      packages = forAllSystems (pkgs: {
+        jj-get = pkgs.callPackage ./package.nix { };
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.jj-get;
+      });
+
+      checks = forAllSystems (pkgs: {
+        inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) jj-get;
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.jj-get ];
           packages = [
-            pkgs.zig
             pkgs.zls
             pkgs.jujutsu
             pkgs.git
@@ -26,6 +35,6 @@
         };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt);
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };
 }
