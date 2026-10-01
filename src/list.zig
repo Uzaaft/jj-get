@@ -6,8 +6,8 @@ const Io = std.Io;
 pub const DiscoverError = Allocator.Error || Io.Dir.OpenError || Io.Dir.Iterator.Error;
 
 /// Finds every jj repository under `root`, returning their paths relative
-/// to it in sorted order. Repositories nested inside another repository
-/// aren't reported, and symlinks aren't followed.
+/// to it in sorted order. Neither jj nor plain Git repositories are
+/// descended into, and symlinks aren't followed.
 pub fn discover(arena: Allocator, io: Io, root: []const u8) DiscoverError![]const []const u8 {
     var dir = try Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
@@ -20,17 +20,21 @@ pub fn discover(arena: Allocator, io: Io, root: []const u8) DiscoverError![]cons
 
 fn walk(arena: Allocator, io: Io, dir: Io.Dir, rel: []const u8, repos: *std.ArrayList([]const u8)) DiscoverError!void {
     var subdirs: std.ArrayList([]const u8) = .empty;
+    var is_git = false;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        if (std.mem.eql(u8, entry.name, ".jj")) {
+        if (std.mem.eql(u8, entry.name, ".jj") and entry.kind == .directory) {
             // A repository; whatever else is in here belongs to it.
             try repos.append(arena, rel);
             return;
         }
-        if (std.mem.eql(u8, entry.name, ".git")) continue;
-        try subdirs.append(arena, try arena.dupe(u8, entry.name));
+        // A file for worktrees and submodules, a directory otherwise.
+        if (std.mem.eql(u8, entry.name, ".git")) is_git = true;
+        if (entry.kind == .directory) try subdirs.append(arena, try arena.dupe(u8, entry.name));
     }
+    // A plain Git working tree can be huge (node_modules, build output)
+    // and isn't where jj repositories live, so don't search it.
+    if (is_git) return;
 
     for (subdirs.items) |name| {
         var sub = dir.openDir(io, name, .{ .iterate = true }) catch |err| switch (err) {
@@ -279,6 +283,7 @@ test discover {
         "github.com/a-b/.jj",
         "github.com/a/one/nested/.jj",
         "github.com/a/plain-git/.git",
+        "github.com/a/plain-git/vendor/inner/.jj",
         "gitlab.com/x/.jj",
         "empty",
     }) |path| try tmp.dir.createDirPath(io, path);
