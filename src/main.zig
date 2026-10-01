@@ -3,69 +3,74 @@ const Io = std.Io;
 
 const jj_get = @import("jj_get");
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const usage =
+    \\Usage: jj-get [options] <repository>
+    \\
+    \\Clone a repository into ~/repositories/<host>/<path> using jj.
+    \\
+    \\Repository formats:
+    \\  user/repo                         resolved against github.com
+    \\  github.com/user/repo
+    \\  https://github.com/user/repo.git
+    \\  git@github.com:user/repo.git
+    \\
+    \\Options:
+    \\  -h, --help    Show this help
+    \\
+;
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
+pub fn main(init: std.process.Init) !u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+    defer stderr.flush() catch {};
+
+    var repo: ?[]const u8 = null;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            var stdout_writer: Io.File.Writer = .init(.stdout(), io, &.{});
+            try stdout_writer.interface.writeAll(usage);
+            return 0;
+        } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
+            try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
+            return 2;
+        } else if (repo != null) {
+            try stderr.print("error: unexpected argument '{s}'\n\n{s}", .{ arg, usage });
+            return 2;
+        } else {
+            repo = arg;
+        }
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try jj_get.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+    const home = init.environ_map.get("HOME") orelse {
+        try stderr.writeAll("error: HOME is not set\n");
+        return 1;
     };
+
+    const target = jj_get.get.resolve(arena, repo orelse {
+        try stderr.print("error: missing repository\n\n{s}", .{usage});
+        return 2;
+    }, .{
+        .root = try std.fs.path.join(arena, &.{ home, "repositories" }),
+    }) catch |err| switch (err) {
+        error.EmptyPath => {
+            try stderr.print("error: invalid repository '{s}'\n", .{repo.?});
+            return 1;
+        },
+        else => |e| return e,
+    };
+
+    jj_get.get.clone(io, target) catch |err| switch (err) {
+        error.CloneFailed => return 1,
+        error.AlreadyExists => {
+            try stderr.print("error: {s} already exists\n", .{target.dest});
+            return 1;
+        },
+        else => |e| return e,
+    };
+    return 0;
 }
