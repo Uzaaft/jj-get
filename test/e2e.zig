@@ -90,6 +90,23 @@ const Sandbox = struct {
         return std.fs.path.join(self.arena.allocator(), &.{ root, std.mem.trimStart(u8, url["file://".len..], "/") });
     }
 
+    /// Clones `url` under `root` with jj-get.
+    fn clone(self: *Sandbox, root: []const u8, url: []const u8) !void {
+        _ = try self.ok(&.{ jj_get, "--root", root, url });
+    }
+
+    /// Returns a `jj-list` symlink to the binary, as installed.
+    fn jjList(self: *Sandbox) ![]const u8 {
+        const link = try self.path("jj-list");
+        // The binary's path from the build system is relative to the cwd.
+        const target = try Io.Dir.cwd().realPathFileAlloc(testing.io, jj_get, self.arena.allocator());
+        self.tmp.dir.symLink(testing.io, target, "jj-list", .{}) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => |e| return e,
+        };
+        return link;
+    }
+
     fn exists(self: *Sandbox, sub_path: []const u8) bool {
         Io.Dir.cwd().access(testing.io, sub_path, .{}) catch return false;
         _ = self;
@@ -201,4 +218,26 @@ test "get rejects invalid config values" {
     const result = try sb.run(&.{ jj_get, "a/b" });
     try expectExit(1, result);
     try testing.expect(std.mem.indexOf(u8, result.stderr, "JJGET_SKIP_HOST") != null);
+}
+
+test "list prints every repository under the root" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    const b = try sb.source("src/b");
+    const a = try sb.source("src/a");
+    try sb.clone(root, b);
+    try sb.clone(root, a);
+
+    const out = try sb.ok(&.{ try sb.jjList(), "--root", root });
+    const want = try std.fmt.allocPrint(sb.arena.allocator(), "{s}\n{s}\n", .{ try sb.dest(root, a), try sb.dest(root, b) });
+    try testing.expectEqualStrings(want, out);
+}
+
+test "list fails on a missing root" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const result = try sb.run(&.{ try sb.jjList(), "--root", try sb.path("nope") });
+    try expectExit(1, result);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "does not exist") != null);
 }

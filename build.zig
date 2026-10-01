@@ -89,6 +89,13 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // jj-list is the same binary under another name; it picks its
+    // behavior from argv[0].
+    const list_link = b.addSystemCommand(&.{ "ln", "-sf", exe.out_filename, b.getInstallPath(.bin, "jj-list") });
+    list_link.has_side_effects = true;
+    list_link.step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    b.getInstallStep().dependOn(&list_link.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

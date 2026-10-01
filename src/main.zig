@@ -5,7 +5,7 @@ const jj_get = @import("jj_get");
 const Args = jj_get.Args;
 const config = jj_get.config;
 
-const usage =
+const get_usage =
     \\Usage: jj-get [options] <repository>
     \\
     \\Clone a repository into <root>/<host>/<path> using jj.
@@ -26,31 +26,55 @@ const usage =
     \\
 ;
 
+const list_usage =
+    \\Usage: jj-list [options]
+    \\
+    \\List the jj repositories under <root>.
+    \\
+    \\Options:
+    \\  -r, --root <path>  Root directory to scan (default: ~/repositories)
+    \\  -h, --help         Show this help
+    \\
+    \\The root can also be set with JJGET_ROOT or jjget.root in jj's config.
+    \\
+;
+
 pub fn main(init: std.process.Init) !u8 {
-    const arena = init.arena.allocator();
     const io = init.io;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
     defer stderr.flush() catch {};
 
+    // Like git-get, one binary provides both commands and picks one based
+    // on the name it was invoked as, typically through a jj-list symlink.
+    var args: Args = .init(argv[1..]);
+    if (std.mem.eql(u8, std.fs.path.basename(argv[0]), "jj-list")) {
+        return listMain(init, &args, stderr);
+    }
+    return getMain(init, &args, stderr);
+}
+
+fn getMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
+    const usage = get_usage;
+    const arena = init.arena.allocator();
+    const io = init.io;
+
     var repo: ?[]const u8 = null;
     var branch: ?[]const u8 = null;
     var flags: config.Config = .{};
 
-    var args: Args = .init((try init.minimal.args.toSlice(arena))[1..]);
     while (args.next()) |arg| {
-        const parsed = parseOption(&args, &flags, &branch) catch {
+        const parsed = parseOption(args, &flags, &branch) catch {
             try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
             return 2;
         };
         if (parsed) continue;
 
         if (args.flag('h', "help")) {
-            var stdout_writer: Io.File.Writer = .init(.stdout(), io, &.{});
-            try stdout_writer.interface.writeAll(usage);
-            return 0;
+            return printUsage(io, usage);
         } else if (!args.isPositional()) {
             try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
             return 2;
@@ -89,6 +113,53 @@ pub fn main(init: std.process.Init) !u8 {
         },
         else => |e| return e,
     };
+    return 0;
+}
+
+fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
+    const usage = list_usage;
+    const arena = init.arena.allocator();
+    const io = init.io;
+
+    var flags: config.Config = .{};
+    while (args.next()) |arg| {
+        if (args.option('r', "root") catch {
+            try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
+            return 2;
+        }) |v| {
+            flags.root = v;
+        } else if (args.flag('h', "help")) {
+            return printUsage(io, usage);
+        } else if (!args.isPositional()) {
+            try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
+            return 2;
+        } else {
+            try stderr.print("error: unexpected argument '{s}'\n\n{s}", .{ arg, usage });
+            return 2;
+        }
+    }
+
+    const settings = try loadSettings(init, flags, stderr) orelse return 1;
+    const root = settings.root.?;
+    const repos = jj_get.list.discover(arena, io, root) catch |err| switch (err) {
+        error.FileNotFound => {
+            try stderr.print("error: root {s} does not exist\n", .{root});
+            return 1;
+        },
+        else => |e| return e,
+    };
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    for (repos) |repo| try stdout.print("{s}\n", .{try std.fs.path.join(arena, &.{ root, repo })});
+    try stdout.flush();
+    return 0;
+}
+
+fn printUsage(io: Io, usage: []const u8) !u8 {
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &.{});
+    try stdout_writer.interface.writeAll(usage);
     return 0;
 }
 
