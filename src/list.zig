@@ -221,8 +221,16 @@ fn statusInto(arena: Allocator, io: Io, path: []const u8, result: *(StatusError!
     result.* = status(arena, io, path);
 }
 
+/// Orders paths component by component, so `a/b` sorts before `a-b` and
+/// every directory's entries stay together.
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
+        if (x == y) continue;
+        if (x == '/') return true;
+        if (y == '/') return false;
+        return x < y;
+    }
+    return a.len < b.len;
 }
 
 test discover {
@@ -232,6 +240,7 @@ test discover {
     for ([_][]const u8{
         "github.com/b/two/.jj",
         "github.com/a/one/.jj",
+        "github.com/a-b/.jj",
         "github.com/a/one/nested/.jj",
         "github.com/a/plain-git/.git",
         "gitlab.com/x/.jj",
@@ -243,10 +252,11 @@ test discover {
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
     const repos = try discover(arena.allocator(), io, root);
 
-    try std.testing.expectEqual(3, repos.len);
+    try std.testing.expectEqual(4, repos.len);
     try std.testing.expectEqualStrings("github.com/a/one", repos[0]);
-    try std.testing.expectEqualStrings("github.com/b/two", repos[1]);
-    try std.testing.expectEqualStrings("gitlab.com/x", repos[2]);
+    try std.testing.expectEqualStrings("github.com/a-b", repos[1]);
+    try std.testing.expectEqualStrings("github.com/b/two", repos[2]);
+    try std.testing.expectEqualStrings("gitlab.com/x", repos[3]);
 }
 
 test parseStatus {

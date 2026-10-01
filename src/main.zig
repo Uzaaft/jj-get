@@ -32,8 +32,9 @@ const list_usage =
     \\List the jj repositories under <root>.
     \\
     \\Options:
-    \\  -r, --root <path>  Root directory to scan (default: ~/repositories)
-    \\  -h, --help         Show this help
+    \\  -o, --out <format>  Output format: tree or flat (default: tree)
+    \\  -r, --root <path>   Root directory to scan (default: ~/repositories)
+    \\  -h, --help          Show this help
     \\
     \\The root can also be set with JJGET_ROOT or jjget.root in jj's config.
     \\
@@ -122,13 +123,22 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     const io = init.io;
 
     var flags: config.Config = .{};
+    var format: jj_get.render.Format = .tree;
+    var bad_format: []const u8 = "";
     while (args.next()) |arg| {
-        if (args.option('r', "root") catch {
-            try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
-            return 2;
-        }) |v| {
-            flags.root = v;
-        } else if (args.flag('h', "help")) {
+        const parsed = parseListOption(args, &flags, &format, &bad_format) catch |err| switch (err) {
+            error.MissingValue => {
+                try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
+                return 2;
+            },
+            error.UnknownFormat => {
+                try stderr.print("error: unknown output format '{s}'\n\n{s}", .{ bad_format, usage });
+                return 2;
+            },
+        };
+        if (parsed) continue;
+
+        if (args.flag('h', "help")) {
             return printUsage(io, usage);
         } else if (!args.isPositional()) {
             try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
@@ -153,36 +163,30 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     const statuses = try jj_get.list.statusAll(arena, io, root, repos);
-
-    var paths = try arena.alloc([]const u8, repos.len);
-    var path_width: usize = 0;
-    var bookmark_width: usize = 0;
-    for (repos, statuses, 0..) |repo, st, i| {
-        paths[i] = try std.fs.path.join(arena, &.{ root, repo });
-        path_width = @max(path_width, paths[i].len);
-        const bookmark = if (st) |ok| ok.bookmark orelse "-" else |_| "-";
-        bookmark_width = @max(bookmark_width, bookmark.len);
-    }
-
-    var failed = false;
-    for (paths, statuses) |path, st| {
-        try stdout.print("{s}", .{path});
-        try stdout.splatByteAll(' ', path_width - path.len + 2);
-        if (st) |ok| {
-            const bookmark = ok.bookmark orelse "-";
-            try stdout.print("{s}", .{bookmark});
-            try stdout.splatByteAll(' ', bookmark_width - bookmark.len + 2);
-            try stdout.print("{f}\n", .{ok});
-        } else |err| {
-            failed = true;
-            try stdout.writeAll("-");
-            try stdout.splatByteAll(' ', bookmark_width - 1 + 2);
-            try stdout.print("error: {t}\n", .{err});
-        }
+    switch (format) {
+        inline else => |f| try @field(jj_get.render, @tagName(f))(arena, stdout, root, repos, statuses),
     }
     try stdout.flush();
-    if (failed) return 1;
+
+    for (statuses) |st| _ = st catch return 1;
     return 0;
+}
+
+fn parseListOption(
+    args: *Args,
+    flags: *config.Config,
+    format: *jj_get.render.Format,
+    bad_format: *[]const u8,
+) (Args.Error || error{UnknownFormat})!bool {
+    if (try args.option('r', "root")) |v| {
+        flags.root = v;
+    } else if (try args.option('o', "out")) |v| {
+        bad_format.* = v;
+        format.* = std.meta.stringToEnum(jj_get.render.Format, v) orelse return error.UnknownFormat;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 fn printUsage(io: Io, usage: []const u8) !u8 {

@@ -244,7 +244,7 @@ test "list prints every repository under the root" {
     try sb.clone(root, b);
     try sb.clone(root, a);
 
-    const rows = try columns(sb, try sb.ok(&.{ try sb.jjList(), "--root", root }));
+    const rows = try columns(sb, try sb.ok(&.{ try sb.jjList(), "--root", root, "--out", "flat" }));
     try testing.expectEqual(2, rows.len);
     try testing.expectEqualStrings(try sb.dest(root, a), rows[0][0]);
     try testing.expectEqualStrings(try sb.dest(root, b), rows[1][0]);
@@ -265,17 +265,17 @@ test "list reports working copy and bookmark status" {
 
     const file = try std.fs.path.join(sb.arena.allocator(), &.{ dest, "file" });
     try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = "hello" });
-    try testing.expectEqualStrings("modified", (try columns(sb, try sb.ok(&.{ list, "-r", root })))[0][2]);
+    try testing.expectEqualStrings("modified", (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0][2]);
 
     _ = try sb.ok(&.{ "jj", "-R", dest, "commit", "-m", "local" });
     _ = try sb.ok(&.{ "jj", "-R", dest, "bookmark", "set", "main", "-r", "@-" });
-    try testing.expectEqualStrings("main 1 ahead of origin", (try columns(sb, try sb.ok(&.{ list, "-r", root })))[0][2]);
+    try testing.expectEqualStrings("main 1 ahead of origin", (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0][2]);
 
     const src = try sb.path("src/project");
     _ = try sb.ok(&.{ "git", "-C", src, "commit", "--quiet", "--allow-empty", "-m", "upstream" });
     _ = try sb.ok(&.{ "jj", "-R", dest, "git", "fetch" });
     // Both sides moved, so the bookmark is now conflicted.
-    const row = (try columns(sb, try sb.ok(&.{ list, "-r", root })))[0];
+    const row = (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0];
     try testing.expectEqualStrings("main conflicted", row[2]);
 }
 
@@ -285,4 +285,27 @@ test "list fails on a missing root" {
     const result = try sb.run(&.{ try sb.jjList(), "--root", try sb.path("nope") });
     try expectExit(1, result);
     try testing.expect(std.mem.indexOf(u8, result.stderr, "does not exist") != null);
+}
+
+test "list prints a tree by default" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    try sb.clone(root, try sb.source("src/a"));
+    try sb.clone(root, try sb.source("src/b"));
+
+    const out = try sb.ok(&.{ try sb.jjList(), "--root", root });
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    try testing.expectEqualStrings(root, lines.next().?);
+    var last: []const u8 = "";
+    while (lines.next()) |line| last = line;
+    try testing.expect(std.mem.startsWith(u8, last, "    "));
+    try testing.expect(std.mem.indexOf(u8, last, "└── b  main  ok") != null);
+}
+
+test "list rejects unknown formats" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    try expectExit(2, try sb.run(&.{ try sb.jjList(), "--out", "json" }));
+    try expectExit(2, try sb.run(&.{ try sb.jjList(), "--out" }));
 }
