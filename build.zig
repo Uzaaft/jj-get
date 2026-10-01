@@ -142,6 +142,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // End-to-end tests drive the installed binary against local
+    // repositories, so they need jj and git on PATH.
+    const e2e_options = b.addOptions();
+    e2e_options.addOptionPath("jj_get", exe.getEmittedBin());
+    const e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = e2e_options.createModule() },
+            },
+        }),
+    });
+    const run_e2e_tests = b.addRunArtifact(e2e_tests);
+    test_step.dependOn(&run_e2e_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

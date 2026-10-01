@@ -2,6 +2,8 @@
   lib,
   stdenv,
   zig,
+  git,
+  jujutsu,
 }:
 
 stdenv.mkDerivation {
@@ -14,12 +16,17 @@ stdenv.mkDerivation {
       ./build.zig
       ./build.zig.zon
       ./src
+      ./test
     ];
   };
 
   nativeBuildInputs = [ zig.hook ];
 
   doCheck = true;
+  nativeCheckInputs = [
+    git
+    jujutsu
+  ];
 
   meta = {
     description = "Clone and organize jujutsu repositories by URL";
