@@ -220,6 +220,21 @@ test "get rejects invalid config values" {
     try testing.expect(std.mem.indexOf(u8, result.stderr, "JJGET_SKIP_HOST") != null);
 }
 
+/// Splits jj-list output into lines of whitespace-separated columns.
+fn columns(sb: *Sandbox, out: []const u8) ![]const []const []const u8 {
+    const arena = sb.arena.allocator();
+    var rows: std.ArrayList([]const []const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        var cols: std.ArrayList([]const u8) = .empty;
+        // Columns are padded with spaces; the status itself uses ", ".
+        var it = std.mem.tokenizeSequence(u8, line, "  ");
+        while (it.next()) |col| try cols.append(arena, std.mem.trim(u8, col, " "));
+        try rows.append(arena, cols.items);
+    }
+    return rows.items;
+}
+
 test "list prints every repository under the root" {
     const sb = try Sandbox.init();
     defer sb.deinit();
@@ -229,9 +244,39 @@ test "list prints every repository under the root" {
     try sb.clone(root, b);
     try sb.clone(root, a);
 
-    const out = try sb.ok(&.{ try sb.jjList(), "--root", root });
-    const want = try std.fmt.allocPrint(sb.arena.allocator(), "{s}\n{s}\n", .{ try sb.dest(root, a), try sb.dest(root, b) });
-    try testing.expectEqualStrings(want, out);
+    const rows = try columns(sb, try sb.ok(&.{ try sb.jjList(), "--root", root }));
+    try testing.expectEqual(2, rows.len);
+    try testing.expectEqualStrings(try sb.dest(root, a), rows[0][0]);
+    try testing.expectEqualStrings(try sb.dest(root, b), rows[1][0]);
+    for (rows) |row| {
+        try testing.expectEqualStrings("main", row[1]);
+        try testing.expectEqualStrings("ok", row[2]);
+    }
+}
+
+test "list reports working copy and bookmark status" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    const url = try sb.source("src/project");
+    try sb.clone(root, url);
+    const dest = try sb.dest(root, url);
+    const list = try sb.jjList();
+
+    const file = try std.fs.path.join(sb.arena.allocator(), &.{ dest, "file" });
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = "hello" });
+    try testing.expectEqualStrings("modified", (try columns(sb, try sb.ok(&.{ list, "-r", root })))[0][2]);
+
+    _ = try sb.ok(&.{ "jj", "-R", dest, "commit", "-m", "local" });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "bookmark", "set", "main", "-r", "@-" });
+    try testing.expectEqualStrings("main 1 ahead of origin", (try columns(sb, try sb.ok(&.{ list, "-r", root })))[0][2]);
+
+    const src = try sb.path("src/project");
+    _ = try sb.ok(&.{ "git", "-C", src, "commit", "--quiet", "--allow-empty", "-m", "upstream" });
+    _ = try sb.ok(&.{ "jj", "-R", dest, "git", "fetch" });
+    // Both sides moved, so the bookmark is now conflicted.
+    const row = (try columns(sb, try sb.ok(&.{ list, "-r", root })))[0];
+    try testing.expectEqualStrings("main conflicted", row[2]);
 }
 
 test "list fails on a missing root" {

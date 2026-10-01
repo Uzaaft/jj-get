@@ -152,8 +152,36 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    for (repos) |repo| try stdout.print("{s}\n", .{try std.fs.path.join(arena, &.{ root, repo })});
+    const statuses = try jj_get.list.statusAll(arena, io, root, repos);
+
+    var paths = try arena.alloc([]const u8, repos.len);
+    var path_width: usize = 0;
+    var bookmark_width: usize = 0;
+    for (repos, statuses, 0..) |repo, st, i| {
+        paths[i] = try std.fs.path.join(arena, &.{ root, repo });
+        path_width = @max(path_width, paths[i].len);
+        const bookmark = if (st) |ok| ok.bookmark orelse "-" else |_| "-";
+        bookmark_width = @max(bookmark_width, bookmark.len);
+    }
+
+    var failed = false;
+    for (paths, statuses) |path, st| {
+        try stdout.print("{s}", .{path});
+        try stdout.splatByteAll(' ', path_width - path.len + 2);
+        if (st) |ok| {
+            const bookmark = ok.bookmark orelse "-";
+            try stdout.print("{s}", .{bookmark});
+            try stdout.splatByteAll(' ', bookmark_width - bookmark.len + 2);
+            try stdout.print("{f}\n", .{ok});
+        } else |err| {
+            failed = true;
+            try stdout.writeAll("-");
+            try stdout.splatByteAll(' ', bookmark_width - 1 + 2);
+            try stdout.print("error: {t}\n", .{err});
+        }
+    }
     try stdout.flush();
+    if (failed) return 1;
     return 0;
 }
 
