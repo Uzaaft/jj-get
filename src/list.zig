@@ -204,21 +204,48 @@ fn parseBool(field: ?[]const u8) error{InvalidOutput}!bool {
     return error.InvalidOutput;
 }
 
-/// Reads the status of every repository concurrently. A repository whose
-/// status can't be read gets an error instead. `arena` must be threadsafe.
-pub fn statusAll(arena: Allocator, io: Io, root: []const u8, repos: []const []const u8) (Allocator.Error || Io.Cancelable)![]StatusError!Status {
-    const results = try arena.alloc(StatusError!Status, repos.len);
+/// Returns the URL of the repository's `origin` remote, falling back to
+/// its first remote, or null if it has none.
+pub fn remoteUrl(arena: Allocator, io: Io, path: []const u8) StatusError!?[]const u8 {
+    const out = try jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "--ignore-working-copy", "git", "remote", "list" });
+    return parseRemotes(out);
+}
+
+fn parseRemotes(out: []const u8) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const url = line[space + 1 ..];
+        if (std.mem.eql(u8, line[0..space], "origin")) return url;
+        if (first == null) first = url;
+    }
+    return first;
+}
+
+/// Calls `f` on every repository under `root` concurrently, returning
+/// the results in order. `arena` must be threadsafe.
+pub fn forEach(
+    comptime T: type,
+    arena: Allocator,
+    io: Io,
+    root: []const u8,
+    repos: []const []const u8,
+    comptime f: fn (Allocator, Io, []const u8) T,
+) (Allocator.Error || Io.Cancelable)![]T {
+    const Task = struct {
+        fn run(a: Allocator, i: Io, path: []const u8, result: *T) void {
+            result.* = f(a, i, path);
+        }
+    };
+    const results = try arena.alloc(T, repos.len);
     var group: Io.Group = .init;
     defer group.cancel(io);
     for (repos, results) |repo, *result| {
-        group.async(io, statusInto, .{ arena, io, try std.fs.path.join(arena, &.{ root, repo }), result });
+        group.async(io, Task.run, .{ arena, io, try std.fs.path.join(arena, &.{ root, repo }), result });
     }
     try group.await(io);
     return results;
-}
-
-fn statusInto(arena: Allocator, io: Io, path: []const u8, result: *(StatusError!Status)) void {
-    result.* = status(arena, io, path);
 }
 
 /// Orders paths component by component, so `a/b` sorts before `a-b` and
@@ -288,4 +315,10 @@ test parseStatus {
     try std.testing.expectEqualStrings("main 3 ahead of origin", try std.fmt.allocPrint(arena.allocator(), "{f}", .{ahead}));
 
     try std.testing.expectError(error.InvalidOutput, parseStatus(arena.allocator(), "yes\n", ""));
+}
+
+test parseRemotes {
+    try std.testing.expectEqualStrings("b", parseRemotes("upstream a\norigin b\n").?);
+    try std.testing.expectEqualStrings("a", parseRemotes("upstream a\nfork c\n").?);
+    try std.testing.expectEqual(null, parseRemotes(""));
 }

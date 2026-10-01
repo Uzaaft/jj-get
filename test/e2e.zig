@@ -309,3 +309,21 @@ test "list rejects unknown formats" {
     try expectExit(2, try sb.run(&.{ try sb.jjList(), "--out", "json" }));
     try expectExit(2, try sb.run(&.{ try sb.jjList(), "--out" }));
 }
+
+test "list dumps clone urls" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    const a = try sb.source("src/a");
+    const b = try sb.source("src/b");
+    try sb.clone(root, a);
+    try sb.clone(root, b);
+    // A repository without a remote can't be dumped.
+    _ = try sb.ok(&.{ "jj", "git", "init", try sb.path("repos/local") });
+
+    const result = try sb.run(&.{ try sb.jjList(), "--root", root, "--out", "dump" });
+    try expectExit(0, result);
+    const want = try std.fmt.allocPrint(sb.arena.allocator(), "{s}\n{s}\n", .{ a, b });
+    try testing.expectEqualStrings(want, result.stdout);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "has no remote") != null);
+}

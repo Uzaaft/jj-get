@@ -5,7 +5,7 @@ const Io = std.Io;
 
 const list = @import("list.zig");
 
-pub const Format = enum { tree, flat };
+pub const Format = enum { tree, flat, dump };
 
 pub const Result = list.StatusError!list.Status;
 
@@ -16,6 +16,14 @@ pub fn flat(arena: Allocator, w: *Io.Writer, root: []const u8, repos: []const []
         try rows.append(arena, try .init(arena, try std.fs.path.join(arena, &.{ root, repo }), st));
     }
     try writeRows(w, rows.items);
+}
+
+/// Writes one clone URL per line, in the format `jj-get --dump` reads.
+/// Repositories without a remote can't be restored and are skipped.
+pub fn dump(w: *Io.Writer, urls: []const list.StatusError!?[]const u8) !void {
+    for (urls) |url| {
+        if (url catch null) |u| try w.print("{s}\n", .{u});
+    }
 }
 
 /// Writes the repositories as a tree rooted at `root`, with each

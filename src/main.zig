@@ -32,7 +32,7 @@ const list_usage =
     \\List the jj repositories under <root>.
     \\
     \\Options:
-    \\  -o, --out <format>  Output format: tree or flat (default: tree)
+    \\  -o, --out <format>  Output format: tree, flat or dump (default: tree)
     \\  -r, --root <path>   Root directory to scan (default: ~/repositories)
     \\  -h, --help          Show this help
     \\
@@ -162,8 +162,27 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    const statuses = try jj_get.list.statusAll(arena, io, root, repos);
+    if (format == .dump) {
+        const urls = try jj_get.list.forEach(jj_get.list.StatusError!?[]const u8, arena, io, root, repos, jj_get.list.remoteUrl);
+        try jj_get.render.dump(stdout, urls);
+        try stdout.flush();
+
+        var failed = false;
+        for (repos, urls) |repo, url| {
+            const path = try std.fs.path.join(arena, &.{ root, repo });
+            if (url) |u| {
+                if (u == null) try stderr.print("warning: {s} has no remote, skipping\n", .{path});
+            } else |err| {
+                try stderr.print("error: {s}: {t}\n", .{ path, err });
+                failed = true;
+            }
+        }
+        return @intFromBool(failed);
+    }
+
+    const statuses = try jj_get.list.forEach(jj_get.render.Result, arena, io, root, repos, jj_get.list.status);
     switch (format) {
+        .dump => unreachable,
         inline else => |f| try @field(jj_get.render, @tagName(f))(arena, stdout, root, repos, statuses),
     }
     try stdout.flush();
