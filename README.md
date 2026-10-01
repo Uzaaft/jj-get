@@ -11,10 +11,11 @@ $ jj-list
 /home/me/repositories
 ├── codeberg.org
 │   └── ziglings
-│       └── exercises  main  ok
+│       └── exercises main ok
 └── github.com
     └── grdl
-        └── git-get    main  modified, main 1 ahead of origin
+        └── git-get main 1 ahead [ 2 changed ]
+                    feature no upstream
 ```
 
 A single binary provides two commands, chosen by the name it is
@@ -86,24 +87,29 @@ jj-list [options]
 
 | Option | Description |
 | --- | --- |
+| `--color <when>` | `auto` (default), `always` or `never`; `auto` honors `NO_COLOR` |
 | `-f, --fetch` | Run `jj git fetch --all-remotes` in each repository first |
 | `-o, --out <format>` | `tree` (default), `flat` or `dump` |
 | `-r, --root <path>` | Root directory to scan (default: `~/repositories`) |
 
-Each repository is shown with the nearest bookmark at or below its
-working-copy commit, then its status:
+The output follows git-list's. Each repository shows its current
+bookmark, the nearest one at or below the working-copy commit, with
+its status and the state of the working-copy commit. Every other local
+bookmark follows on its own line.
 
 | Status | Meaning |
 | --- | --- |
-| `ok` | Nothing to report |
-| `modified` | The working-copy commit has changes |
-| `conflict` | The working-copy commit has conflicts |
-| `main conflicted` | The `main` bookmark is conflicted |
-| `main 1 ahead of origin` | `main` has commits not on `main@origin` |
-| `main 2 behind origin` | `main@origin` has commits not on `main` |
+| `ok` | In sync with its tracked remote |
+| `1 ahead 2 behind` | Commits on the bookmark not on its remote, and vice versa |
+| `origin 1 ahead, upstream 2 behind` | The same, when tracking several remotes |
+| `no upstream` | Not tracking any remote |
+| `conflicted` | The bookmark is conflicted |
+| `[ 2 changed 1 conflicted ]` | Files changed and conflicted in the working-copy commit |
 
-Repositories are queried concurrently, and `jj-list` exits with status
-1 if any of them couldn't be read.
+Repositories that can't be read show `error`, with jj's messages listed
+after the tree, and make `jj-list` exit with status 1. Repositories are
+queried concurrently with one jj invocation each, and directories
+holding plain Git repositories aren't searched.
 
 ### Backing up and restoring
 
@@ -146,9 +152,10 @@ A leading `~` in the root is expanded.
 
 - Clones are jj repositories, colocated with Git unless your jj config
   says otherwise.
-- Status is expressed in jj terms: working-copy changes and conflicts,
-  conflicted bookmarks, and tracked bookmarks ahead of or behind their
-  remotes. There is no "untracked" state since jj tracks every file.
+- Status is expressed in jj terms: the current branch is the nearest
+  bookmark below the working copy, uncommitted changes are the files
+  changed in the working-copy commit, and there is no "untracked" state
+  since jj tracks every file. Bookmarks can track several remotes.
 - `--branch` accepts bookmarks but not tags, and fetches only that
   bookmark.
 - `host/user/repo` references use their own host rather than being

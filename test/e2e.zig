@@ -222,19 +222,14 @@ test "get rejects invalid config values" {
     try testing.expect(std.mem.indexOf(u8, result.stderr, "JJGET_SKIP_HOST") != null);
 }
 
-/// Splits jj-list output into lines of whitespace-separated columns.
-fn columns(sb: *Sandbox, out: []const u8) ![]const []const []const u8 {
-    const arena = sb.arena.allocator();
-    var rows: std.ArrayList([]const []const u8) = .empty;
+/// Returns the status part of the flat jj-list line for `dest`.
+fn statusOf(out: []const u8, dest: []const u8) ![]const u8 {
     var lines = std.mem.tokenizeScalar(u8, out, '\n');
     while (lines.next()) |line| {
-        var cols: std.ArrayList([]const u8) = .empty;
-        // Columns are padded with spaces; the status itself uses ", ".
-        var it = std.mem.tokenizeSequence(u8, line, "  ");
-        while (it.next()) |col| try cols.append(arena, std.mem.trim(u8, col, " "));
-        try rows.append(arena, cols.items);
+        if (std.mem.startsWith(u8, line, dest) and line.len > dest.len and line[dest.len] == ' ') return line[dest.len + 1 ..];
     }
-    return rows.items;
+    std.debug.print("no line for {s} in:\n{s}\n", .{ dest, out });
+    return error.TestUnexpectedResult;
 }
 
 test "list prints every repository under the root" {
@@ -246,14 +241,9 @@ test "list prints every repository under the root" {
     try sb.clone(root, b);
     try sb.clone(root, a);
 
-    const rows = try columns(sb, try sb.ok(&.{ try sb.jjList(), "--root", root, "--out", "flat" }));
-    try testing.expectEqual(2, rows.len);
-    try testing.expectEqualStrings(try sb.dest(root, a), rows[0][0]);
-    try testing.expectEqualStrings(try sb.dest(root, b), rows[1][0]);
-    for (rows) |row| {
-        try testing.expectEqualStrings("main", row[1]);
-        try testing.expectEqualStrings("ok", row[2]);
-    }
+    const out = try sb.ok(&.{ try sb.jjList(), "--root", root, "--out", "flat" });
+    const want = try std.fmt.allocPrint(sb.arena.allocator(), "{s} main ok\n{s} main ok\n", .{ try sb.dest(root, a), try sb.dest(root, b) });
+    try testing.expectEqualStrings(want, out);
 }
 
 test "list reports working copy and bookmark status" {
@@ -267,18 +257,24 @@ test "list reports working copy and bookmark status" {
 
     const file = try std.fs.path.join(sb.arena.allocator(), &.{ dest, "file" });
     try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = file, .data = "hello" });
-    try testing.expectEqualStrings("modified", (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0][2]);
+    try testing.expectEqualStrings("main [ 1 changed ]", try statusOf(try sb.ok(&.{ list, "-r", root, "-o", "flat" }), dest));
 
     _ = try sb.ok(&.{ "jj", "-R", dest, "commit", "-m", "local" });
     _ = try sb.ok(&.{ "jj", "-R", dest, "bookmark", "set", "main", "-r", "@-" });
-    try testing.expectEqualStrings("main 1 ahead of origin", (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0][2]);
+    try testing.expectEqualStrings("main 1 ahead", try statusOf(try sb.ok(&.{ list, "-r", root, "-o", "flat" }), dest));
+
+    // Other bookmarks are listed below the current one.
+    _ = try sb.ok(&.{ "jj", "-R", dest, "bookmark", "create", "feature", "-r", "main-" });
+    const out = try sb.ok(&.{ list, "-r", root, "-o", "flat" });
+    const want = try std.fmt.allocPrint(sb.arena.allocator(), "{s} feature no upstream\n", .{try spaces(sb, dest.len)});
+    try testing.expect(std.mem.indexOf(u8, out, want) != null);
+    _ = try sb.ok(&.{ "jj", "-R", dest, "bookmark", "delete", "feature" });
 
     const src = try sb.path("src/project");
     _ = try sb.ok(&.{ "git", "-C", src, "commit", "--quiet", "--allow-empty", "-m", "upstream" });
     _ = try sb.ok(&.{ "jj", "-R", dest, "git", "fetch" });
     // Both sides moved, so the bookmark is now conflicted.
-    const row = (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0];
-    try testing.expectEqualStrings("main conflicted", row[2]);
+    try testing.expectEqualStrings("main conflicted", try statusOf(try sb.ok(&.{ list, "-r", root, "-o", "flat" }), dest));
 }
 
 test "list fails on a missing root" {
@@ -302,7 +298,7 @@ test "list prints a tree by default" {
     var last: []const u8 = "";
     while (lines.next()) |line| last = line;
     try testing.expect(std.mem.startsWith(u8, last, "    "));
-    try testing.expect(std.mem.indexOf(u8, last, "└── b  main  ok") != null);
+    try testing.expect(std.mem.indexOf(u8, last, "└── b main ok") != null);
 }
 
 test "list rejects unknown formats" {
@@ -401,11 +397,43 @@ test "list fetches before reading status" {
     const list = try sb.jjList();
 
     // Without fetching the new upstream commit is unknown.
-    try testing.expectEqualStrings("ok", (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0][2]);
+    const dest = try sb.dest(root, url);
+    try testing.expectEqualStrings("main ok", try statusOf(try sb.ok(&.{ list, "-r", root, "-o", "flat" }), dest));
 
     // A tracked bookmark with no local changes simply moves forward.
-    const dest = try sb.dest(root, url);
     _ = try sb.ok(&.{ list, "-r", root, "-o", "flat", "--fetch" });
     const desc = try sb.ok(&.{ "jj", "-R", dest, "log", "--no-graph", "-r", "main", "-T", "description" });
     try testing.expectEqualStrings("upstream\n", desc);
+}
+
+fn spaces(sb: *Sandbox, n: usize) ![]const u8 {
+    const s = try sb.arena.allocator().alloc(u8, n);
+    @memset(s, ' ');
+    return s;
+}
+
+test "list reports repositories it can't read" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    try sb.clone(root, try sb.source("src/a"));
+    // Looks like a repository to discovery, but isn't one.
+    try sb.tmp.dir.createDirPath(testing.io, "repos/broken/.jj");
+
+    const result = try sb.run(&.{ try sb.jjList(), "--root", root, "-o", "flat" });
+    try expectExit(1, result);
+    const broken = try sb.path("repos/broken");
+    try testing.expectEqualStrings("error", try statusOf(result.stdout, broken));
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "Oops, errors happened") != null);
+}
+
+test "list colors output on request" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    try sb.clone(root, try sb.source("src/a"));
+    const colored = try sb.ok(&.{ try sb.jjList(), "--root", root, "--color", "always" });
+    try testing.expect(std.mem.indexOf(u8, colored, "\x1b[1;32mok\x1b[0m") != null);
+    const plain = try sb.ok(&.{ try sb.jjList(), "--root", root });
+    try testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
 }

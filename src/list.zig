@@ -48,180 +48,173 @@ fn walk(arena: Allocator, io: Io, dir: Io.Dir, rel: []const u8, repos: *std.Arra
     }
 }
 
-/// A tracked remote bookmark that has diverged from its local bookmark.
-pub const Divergence = struct {
+/// The result of querying a repository: a value, or jj's error message.
+pub fn Outcome(comptime T: type) type {
+    return union(enum) {
+        ok: T,
+        err: []const u8,
+    };
+}
+
+/// A local bookmark's relationship with one of its tracked remotes.
+pub const Remote = struct {
     name: []const u8,
-    remote: []const u8,
     /// Commits on the local bookmark not on the remote.
     ahead: u64,
     /// Commits on the remote bookmark not on the local one.
     behind: u64,
 };
 
+pub const Bookmark = struct {
+    name: []const u8,
+    conflict: bool = false,
+    /// Tracked remotes, whether in sync or not.
+    remotes: []const Remote = &.{},
+};
+
 /// The state of a repository's working copy and bookmarks.
 pub const Status = struct {
     /// The closest bookmark at or below the working-copy commit, preferring
     /// local bookmarks, e.g. `main` or `main@origin`.
-    bookmark: ?[]const u8 = null,
-    /// The working-copy commit has changes.
-    modified: bool = false,
-    /// The working-copy commit has conflicts.
-    conflict: bool = false,
-    /// Local bookmarks that are conflicted.
-    conflicted_bookmarks: []const []const u8 = &.{},
-    /// Tracked remote bookmarks out of sync with their local bookmark.
-    diverged: []const Divergence = &.{},
+    current: ?[]const u8 = null,
+    /// Files changed in the working-copy commit.
+    changed: u64 = 0,
+    /// Conflicted files in the working-copy commit.
+    conflicted: u64 = 0,
+    /// Local bookmarks, sorted by name.
+    bookmarks: []const Bookmark = &.{},
 
-    pub fn isClean(self: Status) bool {
-        return !self.modified and !self.conflict and
-            self.conflicted_bookmarks.len == 0 and self.diverged.len == 0;
-    }
-
-    /// Writes a short summary such as `ok` or `modified, main 1 ahead of origin`.
-    pub fn format(self: Status, w: *Io.Writer) Io.Writer.Error!void {
-        if (self.isClean()) return w.writeAll("ok");
-        var sep: []const u8 = "";
-        if (self.modified) {
-            try w.writeAll("modified");
-            sep = ", ";
-        }
-        if (self.conflict) {
-            try w.print("{s}conflict", .{sep});
-            sep = ", ";
-        }
-        for (self.conflicted_bookmarks) |name| {
-            try w.print("{s}{s} conflicted", .{ sep, name });
-            sep = ", ";
-        }
-        for (self.diverged) |d| {
-            try w.print("{s}{s}", .{ sep, d.name });
-            if (d.ahead > 0) try w.print(" {d} ahead", .{d.ahead});
-            if (d.ahead > 0 and d.behind > 0) try w.writeAll(",");
-            if (d.behind > 0) try w.print(" {d} behind", .{d.behind});
-            try w.print("{s} {s}", .{ if (d.behind == 0) " of" else "", d.remote });
-            sep = ", ";
-        }
+    pub fn bookmark(self: Status, name: []const u8) ?Bookmark {
+        for (self.bookmarks) |b| if (std.mem.eql(u8, b.name, name)) return b;
+        return null;
     }
 };
 
-// One line per commit: whether it's the working copy, empty, conflicted,
-// and its bookmarks with local ones first. The revset yields the working
-// copy and the nearest bookmarked ancestors.
-const log_revset = "@ | heads(::@ & (bookmarks() | remote_bookmarks()))";
-const log_template =
-    \\current_working_copy ++ "\t" ++ empty ++ "\t" ++ conflict ++ "\t" ++
-    \\separate(" ",
-    \\  local_bookmarks.map(|b| b.name()).join(" "),
-    \\  remote_bookmarks.map(|b| b.name() ++ "@" ++ b.remote()).join(" "),
-    \\) ++ "\n"
+// Everything needed for a status in one jj invocation. The revset covers
+// the working copy, every local and tracked remote bookmark, and the
+// nearest bookmarked ancestors of the working copy; the template emits a
+// tab-separated record per fact of interest on each of those commits.
+//
+// A remote ref's ahead count is how far it is ahead of the local
+// bookmark, so the two are swapped to report from the local bookmark's
+// point of view. The `git` pseudo-remote of colocated repositories
+// mirrors local state and is ignored.
+const status_revset = "@ | bookmarks() | tracked_remote_bookmarks() | heads(::@ & bookmarks()) | heads(::@ & remote_bookmarks())";
+const status_template =
+    \\if(current_working_copy,
+    \\  "wc\t" ++ self.diff().files().len() ++ "\t" ++ self.conflicted_files().len() ++ "\n") ++
+    \\if(self.contained_in("heads(::@ & bookmarks())"),
+    \\  local_bookmarks.map(|b| "near\t" ++ b.name() ++ "\n").join("")) ++
+    \\if(self.contained_in("heads(::@ & remote_bookmarks())"),
+    \\  remote_bookmarks.filter(|b| b.remote() != "git").map(|b|
+    \\    "nearremote\t" ++ b.name() ++ "@" ++ b.remote() ++ "\n").join("")) ++
+    \\local_bookmarks.map(|b| "local\t" ++ b.name() ++ "\t" ++ b.conflict() ++ "\n").join("") ++
+    \\remote_bookmarks.filter(|b| b.tracked() && b.tracking_present() && b.remote() != "git").map(|b|
+    \\  "remote\t" ++ b.name() ++ "\t" ++ b.remote() ++ "\t" ++
+    \\  b.tracking_behind_count().lower() ++ "\t" ++ b.tracking_ahead_count().lower() ++ "\n").join("")
 ;
 
-// Conflicted local bookmarks and tracked remote bookmarks that have
-// diverged from their local counterpart. A remote ref's ahead count is
-// how far it is ahead of the local bookmark, so the two are swapped to
-// report from the local bookmark's point of view. The `git` pseudo-remote
-// of colocated repositories mirrors local state and isn't interesting.
-const bookmark_template =
-    \\if(remote,
-    \\  if(remote != "git" && tracking_present && !synced,
-    \\    "remote\t" ++ name ++ "\t" ++ remote ++ "\t" ++
-    \\    self.tracking_behind_count().lower() ++ "\t" ++
-    \\    self.tracking_ahead_count().lower() ++ "\n"),
-    \\  if(conflict, "conflict\t" ++ name ++ "\n"))
-;
-
-pub const StatusError = error{ JjFailed, FetchFailed, InvalidOutput } || std.process.RunError;
-
-/// Reads the status of the repository at `path`. The first jj command
-/// snapshots the working copy so modifications are noticed; the second
-/// reuses that snapshot.
-pub fn status(arena: Allocator, io: Io, path: []const u8) StatusError!Status {
-    const log = try jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "log", "--no-graph", "-r", log_revset, "-T", log_template });
-    const bookmarks = try jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "--ignore-working-copy", "bookmark", "list", "-T", bookmark_template });
-    return parseStatus(arena, log, bookmarks);
+/// Reads the status of the repository at `path` with a single jj
+/// invocation, which also snapshots the working copy.
+pub fn status(arena: Allocator, io: Io, path: []const u8) Outcome(Status) {
+    const out = switch (jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "log", "--no-graph", "-r", status_revset, "-T", status_template })) {
+        .ok => |out| out,
+        .err => |msg| return .{ .err = msg },
+    };
+    return if (parseStatus(arena, out)) |st| .{ .ok = st } else |err| .{ .err = @errorName(err) };
 }
 
 /// Fetches from every remote, then reads the status of the repository.
-pub fn fetchAndStatus(arena: Allocator, io: Io, path: []const u8) StatusError!Status {
-    _ = jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "git", "fetch", "--all-remotes" }) catch |err| switch (err) {
-        error.JjFailed => return error.FetchFailed,
-        else => |e| return e,
-    };
+pub fn fetchAndStatus(arena: Allocator, io: Io, path: []const u8) Outcome(Status) {
+    switch (jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "git", "fetch", "--all-remotes" })) {
+        .ok => {},
+        .err => |msg| return .{ .err = msg },
+    }
     return status(arena, io, path);
-}
-
-fn jj(arena: Allocator, io: Io, argv: []const []const u8) StatusError![]const u8 {
-    const result = try std.process.run(arena, io, .{ .argv = argv });
-    if (result.term != .exited or result.term.exited != 0) return error.JjFailed;
-    return result.stdout;
-}
-
-fn parseStatus(arena: Allocator, log: []const u8, bookmarks: []const u8) error{ InvalidOutput, OutOfMemory }!Status {
-    var result: Status = .{};
-
-    var lines = std.mem.tokenizeScalar(u8, log, '\n');
-    while (lines.next()) |line| {
-        var fields = std.mem.splitScalar(u8, line, '\t');
-        const is_wc = try parseBool(fields.next());
-        const empty = try parseBool(fields.next());
-        const conflict = try parseBool(fields.next());
-        const names = fields.next() orelse return error.InvalidOutput;
-        if (is_wc) {
-            result.modified = !empty;
-            result.conflict = conflict;
-        }
-        if (result.bookmark == null and names.len > 0) {
-            result.bookmark = names[0 .. std.mem.indexOfScalar(u8, names, ' ') orelse names.len];
-        }
-    }
-
-    var conflicted: std.ArrayList([]const u8) = .empty;
-    var diverged: std.ArrayList(Divergence) = .empty;
-    lines = std.mem.tokenizeScalar(u8, bookmarks, '\n');
-    while (lines.next()) |line| {
-        var fields = std.mem.splitScalar(u8, line, '\t');
-        const kind = fields.next().?;
-        if (std.mem.eql(u8, kind, "conflict")) {
-            try conflicted.append(arena, fields.next() orelse return error.InvalidOutput);
-        } else if (std.mem.eql(u8, kind, "remote")) {
-            const name = fields.next() orelse return error.InvalidOutput;
-            const remote = fields.next() orelse return error.InvalidOutput;
-            const ahead = std.fmt.parseInt(u64, fields.next() orelse "", 10) catch return error.InvalidOutput;
-            const behind = std.fmt.parseInt(u64, fields.next() orelse "", 10) catch return error.InvalidOutput;
-            try diverged.append(arena, .{ .name = name, .remote = remote, .ahead = ahead, .behind = behind });
-        } else {
-            return error.InvalidOutput;
-        }
-    }
-    // Ahead/behind counts against a conflicted bookmark are meaningless;
-    // the conflict says it all.
-    var i: usize = 0;
-    while (i < diverged.items.len) {
-        const name = diverged.items[i].name;
-        for (conflicted.items) |c| {
-            if (std.mem.eql(u8, c, name)) {
-                _ = diverged.orderedRemove(i);
-                break;
-            }
-        } else i += 1;
-    }
-    result.conflicted_bookmarks = conflicted.items;
-    result.diverged = diverged.items;
-    return result;
-}
-
-fn parseBool(field: ?[]const u8) error{InvalidOutput}!bool {
-    const f = field orelse return error.InvalidOutput;
-    if (std.mem.eql(u8, f, "true")) return true;
-    if (std.mem.eql(u8, f, "false")) return false;
-    return error.InvalidOutput;
 }
 
 /// Returns the URL of the repository's `origin` remote, falling back to
 /// its first remote, or null if it has none.
-pub fn remoteUrl(arena: Allocator, io: Io, path: []const u8) StatusError!?[]const u8 {
-    const out = try jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "--ignore-working-copy", "git", "remote", "list" });
-    return parseRemotes(out);
+pub fn remoteUrl(arena: Allocator, io: Io, path: []const u8) Outcome(?[]const u8) {
+    return switch (jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "--ignore-working-copy", "git", "remote", "list" })) {
+        .ok => |out| .{ .ok = parseRemotes(out) },
+        .err => |msg| .{ .err = msg },
+    };
+}
+
+/// Runs jj, returning its stdout or, on failure, its error message.
+fn jj(arena: Allocator, io: Io, argv: []const []const u8) Outcome([]const u8) {
+    const result = std.process.run(arena, io, .{ .argv = argv }) catch |err| return .{ .err = switch (err) {
+        error.FileNotFound => "jj not found in PATH",
+        else => @errorName(err),
+    } };
+    if (result.term == .exited and result.term.exited == 0) return .{ .ok = result.stdout };
+    const msg = std.mem.trim(u8, result.stderr, " \n");
+    return .{ .err = if (std.mem.startsWith(u8, msg, "Error: ")) msg["Error: ".len..] else if (msg.len > 0) msg else "jj failed" };
+}
+
+fn parseStatus(arena: Allocator, out: []const u8) error{ InvalidOutput, OutOfMemory }!Status {
+    var result: Status = .{};
+    var near_remote: ?[]const u8 = null;
+    var bookmarks: std.StringArrayHashMapUnmanaged(struct { conflict: bool, remotes: std.ArrayList(Remote) }) = .empty;
+
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const kind = fields.next().?;
+        if (std.mem.eql(u8, kind, "wc")) {
+            result.changed = try parseInt(fields.next());
+            result.conflicted = try parseInt(fields.next());
+        } else if (std.mem.eql(u8, kind, "near")) {
+            if (result.current == null) result.current = try field(fields.next());
+        } else if (std.mem.eql(u8, kind, "nearremote")) {
+            if (near_remote == null) near_remote = try field(fields.next());
+        } else if (std.mem.eql(u8, kind, "local")) {
+            const name = try field(fields.next());
+            const conflict = std.mem.eql(u8, try field(fields.next()), "true");
+            // A conflicted bookmark is listed once per target.
+            const entry = try bookmarks.getOrPut(arena, name);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .conflict = conflict, .remotes = .empty };
+        } else if (std.mem.eql(u8, kind, "remote")) {
+            const name = try field(fields.next());
+            const remote: Remote = .{
+                .name = try field(fields.next()),
+                .ahead = try parseInt(fields.next()),
+                .behind = try parseInt(fields.next()),
+            };
+            const entry = try bookmarks.getOrPut(arena, name);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .conflict = false, .remotes = .empty };
+            try entry.value_ptr.remotes.append(arena, remote);
+        } else {
+            return error.InvalidOutput;
+        }
+    }
+    if (result.current == null) result.current = near_remote;
+
+    const list = try arena.alloc(Bookmark, bookmarks.count());
+    for (bookmarks.keys(), bookmarks.values(), list) |name, value, *b| {
+        std.mem.sort(Remote, value.remotes.items, {}, struct {
+            fn lt(_: void, x: Remote, y: Remote) bool {
+                return std.mem.lessThan(u8, x.name, y.name);
+            }
+        }.lt);
+        b.* = .{ .name = name, .conflict = value.conflict, .remotes = value.remotes.items };
+    }
+    std.mem.sort(Bookmark, list, {}, struct {
+        fn lt(_: void, x: Bookmark, y: Bookmark) bool {
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    result.bookmarks = list;
+    return result;
+}
+
+fn field(f: ?[]const u8) error{InvalidOutput}![]const u8 {
+    return f orelse error.InvalidOutput;
+}
+
+fn parseInt(f: ?[]const u8) error{InvalidOutput}!u64 {
+    return std.fmt.parseInt(u64, try field(f), 10) catch error.InvalidOutput;
 }
 
 fn parseRemotes(out: []const u8) ?[]const u8 {
@@ -303,32 +296,34 @@ test discover {
 test parseStatus {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const st = try parseStatus(
-        arena.allocator(),
-        "true\tfalse\tfalse\t\nfalse\ttrue\tfalse\tmain other\n",
-        "remote\tmain\torigin\t1\t2\nconflict\tdev\nremote\tdev\torigin\t1\t0\n",
-    );
-    try std.testing.expectEqualStrings("main", st.bookmark.?);
-    try std.testing.expect(st.modified);
-    try std.testing.expect(!st.conflict);
-    try std.testing.expectEqual(1, st.conflicted_bookmarks.len);
-    try std.testing.expectEqualStrings("dev", st.conflicted_bookmarks[0]);
-    try std.testing.expectEqual(1, st.diverged.len);
-    try std.testing.expectEqual(1, st.diverged[0].ahead);
-    try std.testing.expectEqual(2, st.diverged[0].behind);
+    const st = try parseStatus(arena.allocator(), "wc\t2\t1\n" ++
+        "near\tmain\n" ++
+        "nearremote\tmain@origin\n" ++
+        "local\tmain\tfalse\n" ++
+        "local\tdev\ttrue\n" ++
+        "local\tdev\ttrue\n" ++
+        "remote\tmain\tupstream\t0\t3\n" ++
+        "remote\tmain\torigin\t1\t2\n" ++
+        "local\tlocal-only\tfalse\n");
+    try std.testing.expectEqualStrings("main", st.current.?);
+    try std.testing.expectEqual(2, st.changed);
+    try std.testing.expectEqual(1, st.conflicted);
+    try std.testing.expectEqual(3, st.bookmarks.len);
+    try std.testing.expectEqualStrings("dev", st.bookmarks[0].name);
+    try std.testing.expect(st.bookmarks[0].conflict);
+    try std.testing.expectEqualStrings("local-only", st.bookmarks[1].name);
+    try std.testing.expectEqual(0, st.bookmarks[1].remotes.len);
+    const main = st.bookmark("main").?;
+    try std.testing.expectEqual(2, main.remotes.len);
+    try std.testing.expectEqualStrings("origin", main.remotes[0].name);
+    try std.testing.expectEqual(1, main.remotes[0].ahead);
+    try std.testing.expectEqual(2, main.remotes[0].behind);
 
-    const summary = try std.fmt.allocPrint(arena.allocator(), "{f}", .{st});
-    try std.testing.expectEqualStrings("modified, dev conflicted, main 1 ahead, 2 behind origin", summary);
+    const remote_only = try parseStatus(arena.allocator(), "wc\t0\t0\nnearremote\ttest@origin\n");
+    try std.testing.expectEqualStrings("test@origin", remote_only.current.?);
 
-    const clean = try parseStatus(arena.allocator(), "true\ttrue\tfalse\tmain\n", "");
-    try std.testing.expect(clean.isClean());
-    try std.testing.expectEqualStrings("main", clean.bookmark.?);
-    try std.testing.expectEqualStrings("ok", try std.fmt.allocPrint(arena.allocator(), "{f}", .{clean}));
-
-    const ahead = try parseStatus(arena.allocator(), "true\ttrue\tfalse\t\n", "remote\tmain\torigin\t3\t0\n");
-    try std.testing.expectEqualStrings("main 3 ahead of origin", try std.fmt.allocPrint(arena.allocator(), "{f}", .{ahead}));
-
-    try std.testing.expectError(error.InvalidOutput, parseStatus(arena.allocator(), "yes\n", ""));
+    try std.testing.expectError(error.InvalidOutput, parseStatus(arena.allocator(), "wc\tx\t0\n"));
+    try std.testing.expectError(error.InvalidOutput, parseStatus(arena.allocator(), "bogus\n"));
 }
 
 test parseRemotes {

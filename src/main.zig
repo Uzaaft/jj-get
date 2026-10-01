@@ -37,6 +37,7 @@ const list_usage =
     \\List the jj repositories under <root>.
     \\
     \\Options:
+    \\      --color <when>  Colorize output: auto, always or never (default: auto)
     \\  -f, --fetch         Fetch from all remotes before reading status
     \\  -o, --out <format>  Output format: tree, flat or dump (default: tree)
     \\  -r, --root <path>   Root directory to scan (default: ~/repositories)
@@ -190,16 +191,17 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
 
     var flags: config.Config = .{};
     var format: jj_get.render.Format = .tree;
-    var bad_format: []const u8 = "";
+    var bad_value: []const u8 = "";
     var fetch = false;
+    var color: Color = .auto;
     while (args.next()) |arg| {
-        const parsed = parseListOption(args, &flags, &format, &bad_format) catch |err| switch (err) {
+        const parsed = parseListOption(args, &flags, &format, &color, &bad_value) catch |err| switch (err) {
             error.MissingValue => {
                 try stderr.print("error: option '{s}' requires a value\n\n{s}", .{ arg, usage });
                 return 2;
             },
-            error.UnknownFormat => {
-                try stderr.print("error: unknown output format '{s}'\n\n{s}", .{ bad_format, usage });
+            error.InvalidValue => {
+                try stderr.print("error: invalid value '{s}' for '{s}'\n\n{s}", .{ bad_value, arg, usage });
                 return 2;
             },
         };
@@ -233,19 +235,29 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
+    const use_color = switch (color) {
+        .always => true,
+        .never => false,
+        .auto => no_color: {
+            if (init.environ_map.get("NO_COLOR")) |v| if (v.len > 0) break :no_color false;
+            break :no_color try Io.File.stdout().isTty(io);
+        },
+    };
+
     if (format == .dump) {
-        const urls = try jj_get.list.forEach(jj_get.list.StatusError!?[]const u8, arena, io, root, repos, jj_get.list.remoteUrl);
+        const urls = try jj_get.list.forEach(jj_get.list.Outcome(?[]const u8), arena, io, root, repos, jj_get.list.remoteUrl);
         try jj_get.render.dump(stdout, urls);
         try stdout.flush();
 
         var failed = false;
         for (repos, urls) |repo, url| {
             const path = try std.fs.path.join(arena, &.{ root, repo });
-            if (url) |u| {
-                if (u == null) try stderr.print("warning: {s} has no remote, skipping\n", .{path});
-            } else |err| {
-                try stderr.print("error: {s}: {t}\n", .{ path, err });
-                failed = true;
+            switch (url) {
+                .ok => |u| if (u == null) try stderr.print("warning: {s} has no remote, skipping\n", .{path}),
+                .err => |msg| {
+                    try stderr.print("error: {s}: {s}\n", .{ path, msg });
+                    failed = true;
+                },
             }
         }
         return @intFromBool(failed);
@@ -257,25 +269,31 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
         try jj_get.list.forEach(jj_get.render.Result, arena, io, root, repos, jj_get.list.status);
     switch (format) {
         .dump => unreachable,
-        inline else => |f| try @field(jj_get.render, @tagName(f))(arena, stdout, root, repos, statuses),
+        inline else => |f| try @field(jj_get.render, @tagName(f))(arena, stdout, .{ .color = use_color }, root, repos, statuses),
     }
     try stdout.flush();
 
-    for (statuses) |st| _ = st catch return 1;
+    for (statuses) |st| if (st == .err) return 1;
     return 0;
 }
+
+const Color = enum { auto, always, never };
 
 fn parseListOption(
     args: *Args,
     flags: *config.Config,
     format: *jj_get.render.Format,
-    bad_format: *[]const u8,
-) (Args.Error || error{UnknownFormat})!bool {
+    color: *Color,
+    bad_value: *[]const u8,
+) (Args.Error || error{InvalidValue})!bool {
     if (try args.option('r', "root")) |v| {
         flags.root = v;
     } else if (try args.option('o', "out")) |v| {
-        bad_format.* = v;
-        format.* = std.meta.stringToEnum(jj_get.render.Format, v) orelse return error.UnknownFormat;
+        bad_value.* = v;
+        format.* = std.meta.stringToEnum(jj_get.render.Format, v) orelse return error.InvalidValue;
+    } else if (try args.option(null, "color")) |v| {
+        bad_value.* = v;
+        color.* = std.meta.stringToEnum(Color, v) orelse return error.InvalidValue;
     } else {
         return false;
     }
