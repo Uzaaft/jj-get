@@ -35,6 +35,7 @@ const list_usage =
     \\List the jj repositories under <root>.
     \\
     \\Options:
+    \\  -f, --fetch         Fetch from all remotes before reading status
     \\  -o, --out <format>  Output format: tree, flat or dump (default: tree)
     \\  -r, --root <path>   Root directory to scan (default: ~/repositories)
     \\  -h, --help          Show this help
@@ -185,6 +186,7 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
     var flags: config.Config = .{};
     var format: jj_get.render.Format = .tree;
     var bad_format: []const u8 = "";
+    var fetch = false;
     while (args.next()) |arg| {
         const parsed = parseListOption(args, &flags, &format, &bad_format) catch |err| switch (err) {
             error.MissingValue => {
@@ -198,7 +200,9 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
         };
         if (parsed) continue;
 
-        if (args.flag('h', "help")) {
+        if (args.flag('f', "fetch")) {
+            fetch = true;
+        } else if (args.flag('h', "help")) {
             return printUsage(io, usage);
         } else if (!args.isPositional()) {
             try stderr.print("error: unknown option '{s}'\n\n{s}", .{ arg, usage });
@@ -240,7 +244,10 @@ fn listMain(init: std.process.Init, args: *Args, stderr: *Io.Writer) !u8 {
         return @intFromBool(failed);
     }
 
-    const statuses = try jj_get.list.forEach(jj_get.render.Result, arena, io, root, repos, jj_get.list.status);
+    const statuses = if (fetch)
+        try jj_get.list.forEach(jj_get.render.Result, arena, io, root, repos, jj_get.list.fetchAndStatus)
+    else
+        try jj_get.list.forEach(jj_get.render.Result, arena, io, root, repos, jj_get.list.status);
     switch (format) {
         .dump => unreachable,
         inline else => |f| try @field(jj_get.render, @tagName(f))(arena, stdout, root, repos, statuses),

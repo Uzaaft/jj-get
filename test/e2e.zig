@@ -372,3 +372,23 @@ test "get rejects --dump combined with a repository" {
     defer sb.deinit();
     try expectExit(2, try sb.run(&.{ jj_get, "--dump", "x", "a/b" }));
 }
+
+test "list fetches before reading status" {
+    const sb = try Sandbox.init();
+    defer sb.deinit();
+    const root = try sb.path("repos");
+    const url = try sb.source("src/project");
+    try sb.clone(root, url);
+    const src = try sb.path("src/project");
+    _ = try sb.ok(&.{ "git", "-C", src, "commit", "--quiet", "--allow-empty", "-m", "upstream" });
+    const list = try sb.jjList();
+
+    // Without fetching the new upstream commit is unknown.
+    try testing.expectEqualStrings("ok", (try columns(sb, try sb.ok(&.{ list, "-r", root, "-o", "flat" })))[0][2]);
+
+    // A tracked bookmark with no local changes simply moves forward.
+    const dest = try sb.dest(root, url);
+    _ = try sb.ok(&.{ list, "-r", root, "-o", "flat", "--fetch" });
+    const desc = try sb.ok(&.{ "jj", "-R", dest, "log", "--no-graph", "-r", "main", "-T", "description" });
+    try testing.expectEqualStrings("upstream\n", desc);
+}

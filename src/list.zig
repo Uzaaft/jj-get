@@ -126,7 +126,7 @@ const bookmark_template =
     \\  if(conflict, "conflict\t" ++ name ++ "\n"))
 ;
 
-pub const StatusError = error{ JjFailed, InvalidOutput } || std.process.RunError;
+pub const StatusError = error{ JjFailed, FetchFailed, InvalidOutput } || std.process.RunError;
 
 /// Reads the status of the repository at `path`. The first jj command
 /// snapshots the working copy so modifications are noticed; the second
@@ -135,6 +135,15 @@ pub fn status(arena: Allocator, io: Io, path: []const u8) StatusError!Status {
     const log = try jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "log", "--no-graph", "-r", log_revset, "-T", log_template });
     const bookmarks = try jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "--ignore-working-copy", "bookmark", "list", "-T", bookmark_template });
     return parseStatus(arena, log, bookmarks);
+}
+
+/// Fetches from every remote, then reads the status of the repository.
+pub fn fetchAndStatus(arena: Allocator, io: Io, path: []const u8) StatusError!Status {
+    _ = jj(arena, io, &.{ "jj", "-R", path, "--color=never", "--no-pager", "git", "fetch", "--all-remotes" }) catch |err| switch (err) {
+        error.JjFailed => return error.FetchFailed,
+        else => |e| return e,
+    };
+    return status(arena, io, path);
 }
 
 fn jj(arena: Allocator, io: Io, argv: []const []const u8) StatusError![]const u8 {
