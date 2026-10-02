@@ -1,5 +1,10 @@
 # jj-get
 
+Inspired by [git-get](https://github.com/grdl/git-get) by
+[grdl](https://github.com/grdl) and its contributors. Credit for the
+repository organization workflow and the git-get/git-list command design
+goes to that project.
+
 Clone and organize [Jujutsu](https://github.com/jj-vcs/jj) repositories
 in a directory tree derived from their URLs, like
 [git-get](https://github.com/grdl/git-get) does for Git.
